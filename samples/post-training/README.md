@@ -187,8 +187,34 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 NSYS=1 \
 ```
 
 `flash-attn-3-nv` is a BSD-3-Clause dependency supplied by the pinned Cosmos
-Framework lock. The implementation fails fast for CP>1, interleaved layouts,
-cross-view models, non-SM90 GPUs, or unsupported dtypes.
+Framework lock. This CP=1 launcher keeps context parallelism disabled; the
+distributed single-view FA3 paths are covered by the CP=4 workflow below.
+Interleaved layouts, cross-view models, non-SM90 GPUs, and unsupported dtypes
+still fail fast.
+
+### Optional CP=4 FA3 Ulysses / Zigzag profiling
+
+`run_cp4_attention_ab.sh` keeps CP=4/FSDP=4, FA3, SAC, data, and checkpoint
+fixed while changing only the training CP strategy:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  bash samples/post-training/run_cp4_attention_ab.sh fa3-contiguous
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  bash samples/post-training/run_cp4_attention_ab.sh fa3-zigzag
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  bash samples/post-training/run_cp4_attention_ab.sh fa3-ulysses
+
+# Capture clean iterations after the tokenizer's one-time compile step.
+CUDA_VISIBLE_DEVICES=0,1,2,3 NSYS=1 \
+  bash samples/post-training/run_cp4_attention_ab.sh fa3-ulysses
+```
+
+This workflow currently supports non-interleaved, single-view causal training
+on four Hopper GPUs and requires `split_cp_in_model=false`. Ulysses also
+requires `num_heads % cp_size == 0`. See the
+[implementation and performance report](./CP4_ULYSSES_ZIGZAG_REPORT.md) for
+the layout, correctness checks, benchmark method, and measured results.
 
 ## Required env on compute nodes
 
@@ -219,6 +245,10 @@ Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.
   `TRITON_CACHE_BASE` to `/tmp/triton_$JOB_ID`, then `exec`s `torchrun_smoke.sh`.
 - `triton_per_rank_wrap.sh` — torchrun `--no-python` shim that appends
   `_${LOCAL_RANK}` to `TRITON_CACHE_BASE` so 8 ranks never share a hash dir.
+- `run_cp4_attention_ab.sh` — four-GPU CP=4 launcher for FA3 Contiguous,
+  Zigzag, and Ulysses correctness/performance profiling.
+- `CP4_ULYSSES_ZIGZAG_REPORT.md` — implementation, two-run A/B, memory, and
+  all-rank nsys findings for the CP=4 strategies.
 - `prepare.py` — `snapshot_download`s the HF sample dataset and symlinks its
   per-scene files into the per-camera layout the dataloader expects. Invoked
   by `setup_env.sh`.

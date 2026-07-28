@@ -32,8 +32,16 @@ except ImportError:
 from transformer_engine.pytorch.attention import DotProductAttention
 
 from omnidreams._src.imaginaire.utils import log
-from omnidreams._src.imaginaire.utils.context_parallel import cat_outputs_cp, cat_outputs_cp_with_grad
-from omnidreams._src.omnidreams.modules.block_causal_flash_attention import block_causal_flash_attention
+from omnidreams._src.imaginaire.utils.context_parallel import (
+    cat_outputs_cp,
+    cat_outputs_cp_with_grad,
+    split_inputs_cp,
+)
+from omnidreams._src.omnidreams.modules.block_causal_flash_attention import (
+    block_causal_flash_attention,
+    query_sharded_block_causal_flash_attention,
+    ulysses_block_causal_flash_attention,
+)
 from omnidreams._src.omnidreams.modules.flex_attention import flex_attention_cp
 from omnidreams._src.predict2.conditioner import DataType
 from omnidreams._src.predict2.networks.minimal_v4_dit import (
@@ -93,6 +101,7 @@ class CausalSelfAttention(nn.Module):
         local_attn_size: int = -1,
         sink_size: int = 0,
         training_attention_backend: str = "flex",
+        training_context_parallel_strategy: str = "contiguous",
     ):
         super().__init__()
         log.debug(
@@ -120,6 +129,14 @@ class CausalSelfAttention(nn.Module):
                 f"Invalid training_attention_backend={training_attention_backend!r}; expected 'flex' or 'flash_attn_3'"
             )
         self.training_attention_backend = training_attention_backend
+        if training_context_parallel_strategy not in {"contiguous", "zigzag", "ulysses"}:
+            raise ValueError(
+                "Invalid training_context_parallel_strategy="
+                f"{training_context_parallel_strategy!r}; expected 'contiguous', 'zigzag', or 'ulysses'"
+            )
+        if training_context_parallel_strategy == "ulysses" and training_attention_backend != "flash_attn_3":
+            raise ValueError("The Ulysses CP strategy currently requires training_attention_backend='flash_attn_3'")
+        self.training_context_parallel_strategy = training_context_parallel_strategy
         self.num_frame_per_block = 1
 
         # QKV projections (matching Attention class)
@@ -235,25 +252,44 @@ class CausalSelfAttention(nn.Module):
 
             if self.training_attention_backend == "flash_attn_3":
                 cp_size = 1 if self.cp_group is None else self.cp_group.size()
-                if cp_size != 1:
-                    raise NotImplementedError(
-                        "The FlashAttention-3 block-causal training backend currently supports CP=1 only"
-                    )
                 if video_size is None:
                     raise ValueError("video_size is required by the FlashAttention-3 block-causal backend")
                 expected_sequence_length = video_size.T * video_size.H * video_size.W
-                if s != expected_sequence_length:
+                if s * cp_size != expected_sequence_length:
                     raise ValueError(
-                        "The FlashAttention-3 block-causal backend expects an unsplit full sequence: "
-                        f"got {s} tokens, expected {expected_sequence_length} from video_size={video_size}"
+                        "The FlashAttention-3 block-causal backend received an unexpected local sequence: "
+                        f"got {s} tokens on CP={cp_size}, expected global length "
+                        f"{expected_sequence_length} from video_size={video_size}"
                     )
                 tokens_per_block = video_size.H * video_size.W * self.num_frame_per_block
-                out = block_causal_flash_attention(
-                    roped_q,
-                    roped_k,
-                    v,
-                    tokens_per_block=tokens_per_block,
-                )
+                if cp_size == 1:
+                    out = block_causal_flash_attention(
+                        roped_q,
+                        roped_k,
+                        v,
+                        tokens_per_block=tokens_per_block,
+                    )
+                elif self.training_context_parallel_strategy == "ulysses":
+                    if self.n_heads % cp_size != 0:
+                        raise ValueError(
+                            f"Ulysses CP requires num_heads ({self.n_heads}) to be divisible by CP size ({cp_size})"
+                        )
+                    out = ulysses_block_causal_flash_attention(
+                        roped_q,
+                        roped_k,
+                        v,
+                        tokens_per_block=tokens_per_block,
+                        process_group=self.cp_group,
+                    )
+                else:
+                    out = query_sharded_block_causal_flash_attention(
+                        roped_q,
+                        roped_k,
+                        v,
+                        tokens_per_block=tokens_per_block,
+                        process_group=self.cp_group,
+                        cp_layout=("zigzag" if self.training_context_parallel_strategy == "zigzag" else "contiguous"),
+                    )
             else:
                 # Pad each CP rank's sequence to a multiple of 128 for FlexAttention.
                 padded_length = math.ceil(s / 128) * 128 - s
@@ -274,6 +310,8 @@ class CausalSelfAttention(nn.Module):
                     block_mask=block_mask,
                     process_group=self.cp_group,
                     flex_attention_fn=flex_attention,
+                    cp_layout=("zigzag" if self.training_context_parallel_strategy == "zigzag" else "contiguous"),
+                    local_sequence_length=s,
                 )
 
                 # Remove padding and transpose back.
@@ -413,6 +451,7 @@ class CausalCosmosBlock(nn.Module):
         local_attn_size: int = -1,
         sink_size: int = 0,
         training_attention_backend: str = "flex",
+        training_context_parallel_strategy: str = "contiguous",
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -431,6 +470,7 @@ class CausalCosmosBlock(nn.Module):
             local_attn_size=local_attn_size,
             sink_size=sink_size,
             training_attention_backend=training_attention_backend,
+            training_context_parallel_strategy=training_context_parallel_strategy,
         )
 
         # Cross-attention (using standard Attention from minimal_v4_dit)
@@ -668,6 +708,7 @@ class CosmosCausalDiT(WeightTrainingStat):
         on_the_fly_checkpoint: bool = False,
         use_wan_fp32_strategy: bool = False,
         training_attention_backend: str = "flex",
+        training_context_parallel_strategy: str = "contiguous",
         **kwargs,
     ):
         super().__init__()
@@ -690,6 +731,15 @@ class CosmosCausalDiT(WeightTrainingStat):
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
         self.on_the_fly_checkpoint = on_the_fly_checkpoint
         self.training_attention_backend = training_attention_backend
+        if training_context_parallel_strategy not in {"contiguous", "zigzag", "ulysses"}:
+            raise ValueError(
+                "Invalid training_context_parallel_strategy="
+                f"{training_context_parallel_strategy!r}; expected 'contiguous', 'zigzag', or 'ulysses'"
+            )
+        if training_context_parallel_strategy == "ulysses" and training_attention_backend != "flash_attn_3":
+            raise ValueError("The Ulysses CP strategy currently requires training_attention_backend='flash_attn_3'")
+        self.training_context_parallel_strategy = training_context_parallel_strategy
+        self.training_cp_layout = "zigzag" if training_context_parallel_strategy == "zigzag" else "contiguous"
 
         # Positional embedding settings
         self.pos_emb_cls = pos_emb_cls
@@ -744,6 +794,7 @@ class CosmosCausalDiT(WeightTrainingStat):
                     local_attn_size=local_attn_size,
                     sink_size=sink_size,
                     training_attention_backend=training_attention_backend,
+                    training_context_parallel_strategy=training_context_parallel_strategy,
                 )
                 for _ in range(num_blocks)
             ]
@@ -1086,16 +1137,19 @@ class CosmosCausalDiT(WeightTrainingStat):
         if self._is_context_parallel_enabled and self.cp_group is not None:
             cp_size = self.cp_group.size()
 
-        mask_key = f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}_cp{cp_size}"
+        mask_key = (
+            f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}"
+            f"_interleave{num_interleave}_cp{cp_size}"
+        )
 
         if self.training_attention_backend == "flash_attn_3":
             if num_interleave != 0:
                 raise NotImplementedError(
                     "The FlashAttention-3 block-causal training backend does not support num_interleave > 0"
                 )
-            if cp_size != 1:
-                raise NotImplementedError(
-                    "The FlashAttention-3 block-causal training backend currently supports CP=1 only"
+            if cp_size > 1 and self.training_context_parallel_strategy == "ulysses" and self.num_heads % cp_size != 0:
+                raise ValueError(
+                    f"Ulysses CP requires num_heads ({self.num_heads}) to be divisible by CP size ({cp_size})"
                 )
             if self.patch_temporal != 1:
                 raise NotImplementedError(
@@ -1179,17 +1233,27 @@ class CosmosCausalDiT(WeightTrainingStat):
         # Context parallel: split inputs
         cp_enabled = self._is_context_parallel_enabled and self.cp_group is not None
         if cp_enabled and self.cp_group.size() > 1:
-            from omnidreams._src.imaginaire.utils.context_parallel import split_inputs_cp
-
-            x_B_L_D = split_inputs_cp(x_B_L_D, seq_dim=1, cp_group=self.cp_group)
-            t_emb_B_L_D = split_inputs_cp(t_emb_B_L_D, seq_dim=1, cp_group=self.cp_group)
-            rope_freq = split_inputs_cp(rope_freq, seq_dim=0, cp_group=self.cp_group)
+            x_B_L_D = split_inputs_cp(x_B_L_D, seq_dim=1, cp_group=self.cp_group, layout=self.training_cp_layout)
+            t_emb_B_L_D = split_inputs_cp(
+                t_emb_B_L_D, seq_dim=1, cp_group=self.cp_group, layout=self.training_cp_layout
+            )
+            rope_freq = split_inputs_cp(rope_freq, seq_dim=0, cp_group=self.cp_group, layout=self.training_cp_layout)
 
             if adaln_lora_B_L_3D is not None:
-                adaln_lora_B_L_3D = split_inputs_cp(adaln_lora_B_L_3D, seq_dim=1, cp_group=self.cp_group)
+                adaln_lora_B_L_3D = split_inputs_cp(
+                    adaln_lora_B_L_3D,
+                    seq_dim=1,
+                    cp_group=self.cp_group,
+                    layout=self.training_cp_layout,
+                )
 
             if extra_pos_emb is not None:
-                extra_pos_emb = split_inputs_cp(extra_pos_emb, seq_dim=1, cp_group=self.cp_group)
+                extra_pos_emb = split_inputs_cp(
+                    extra_pos_emb,
+                    seq_dim=1,
+                    cp_group=self.cp_group,
+                    layout=self.training_cp_layout,
+                )
 
             if distributed.get_rank() == 0 and DEBUG:
                 print(f"CP split shapes (train): x={x_B_L_D.shape}, t_emb={t_emb_B_L_D.shape}, rope={rope_freq.shape}")
@@ -1240,7 +1304,12 @@ class CosmosCausalDiT(WeightTrainingStat):
         # Context parallel: gather outputs
         if cp_enabled and self.cp_group is not None:
             # Gather before FinalLayer
-            x_B_L_D = cat_outputs_cp_with_grad(x_B_L_D, seq_dim=1, cp_group=self.cp_group)
+            x_B_L_D = cat_outputs_cp_with_grad(
+                x_B_L_D,
+                seq_dim=1,
+                cp_group=self.cp_group,
+                layout=self.training_cp_layout,
+            )
 
         # Unflatten for FinalLayer
         x_B_T_H_W_D = rearrange(x_B_L_D, "b (t h w) d -> b t h w d", t=video_size.T, h=video_size.H, w=video_size.W)

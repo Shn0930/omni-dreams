@@ -14,7 +14,11 @@ from torch.distributed._composable.fsdp import fully_shard
 from torchvision import transforms
 
 from omnidreams._src.imaginaire.utils import distributed
-from omnidreams._src.imaginaire.utils.context_parallel import cat_outputs_cp, cat_outputs_cp_with_grad
+from omnidreams._src.imaginaire.utils.context_parallel import (
+    cat_outputs_cp,
+    cat_outputs_cp_with_grad,
+    split_inputs_cp,
+)
 from omnidreams._src.omnidreams.networks.causal_cosmos import (
     DEBUG,
     CosmosCausalDiT,
@@ -180,16 +184,19 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
         if self._is_context_parallel_enabled and self.cp_group is not None:
             cp_size = self.cp_group.size()
 
-        mask_key = f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}_cp{cp_size}"
+        mask_key = (
+            f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}"
+            f"_interleave{num_interleave}_cp{cp_size}"
+        )
 
         if self.training_attention_backend == "flash_attn_3":
             if num_interleave != 0:
                 raise NotImplementedError(
                     "The FlashAttention-3 block-causal training backend does not support num_interleave > 0"
                 )
-            if cp_size != 1:
-                raise NotImplementedError(
-                    "The FlashAttention-3 block-causal training backend currently supports CP=1 only"
+            if cp_size > 1 and self.training_context_parallel_strategy == "ulysses" and self.num_heads % cp_size != 0:
+                raise ValueError(
+                    f"Ulysses CP requires num_heads ({self.num_heads}) to be divisible by CP size ({cp_size})"
                 )
             if self.patch_temporal != 1:
                 raise NotImplementedError(
@@ -282,17 +289,27 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
         # Context parallel: split inputs
         cp_enabled = self._is_context_parallel_enabled and self.cp_group is not None
         if cp_enabled and self.cp_group.size() > 1:
-            from omnidreams._src.imaginaire.utils.context_parallel import split_inputs_cp
-
-            x_B_L_D = split_inputs_cp(x_B_L_D, seq_dim=1, cp_group=self.cp_group)
-            t_emb_B_L_D = split_inputs_cp(t_emb_B_L_D, seq_dim=1, cp_group=self.cp_group)
-            rope_freq = split_inputs_cp(rope_freq, seq_dim=0, cp_group=self.cp_group)
+            x_B_L_D = split_inputs_cp(x_B_L_D, seq_dim=1, cp_group=self.cp_group, layout=self.training_cp_layout)
+            t_emb_B_L_D = split_inputs_cp(
+                t_emb_B_L_D, seq_dim=1, cp_group=self.cp_group, layout=self.training_cp_layout
+            )
+            rope_freq = split_inputs_cp(rope_freq, seq_dim=0, cp_group=self.cp_group, layout=self.training_cp_layout)
 
             if adaln_lora_B_L_3D is not None:
-                adaln_lora_B_L_3D = split_inputs_cp(adaln_lora_B_L_3D, seq_dim=1, cp_group=self.cp_group)
+                adaln_lora_B_L_3D = split_inputs_cp(
+                    adaln_lora_B_L_3D,
+                    seq_dim=1,
+                    cp_group=self.cp_group,
+                    layout=self.training_cp_layout,
+                )
 
             if extra_pos_emb is not None:
-                extra_pos_emb = split_inputs_cp(extra_pos_emb, seq_dim=1, cp_group=self.cp_group)
+                extra_pos_emb = split_inputs_cp(
+                    extra_pos_emb,
+                    seq_dim=1,
+                    cp_group=self.cp_group,
+                    layout=self.training_cp_layout,
+                )
 
             if distributed.get_rank() == 0 and DEBUG:
                 print(f"CP split shapes (train): x={x_B_L_D.shape}, t_emb={t_emb_B_L_D.shape}, rope={rope_freq.shape}")
@@ -343,7 +360,12 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
         # Context parallel: gather outputs
         if cp_enabled and self.cp_group is not None:
             # Gather before FinalLayer
-            x_B_L_D = cat_outputs_cp_with_grad(x_B_L_D, seq_dim=1, cp_group=self.cp_group)
+            x_B_L_D = cat_outputs_cp_with_grad(
+                x_B_L_D,
+                seq_dim=1,
+                cp_group=self.cp_group,
+                layout=self.training_cp_layout,
+            )
 
         # Unflatten for FinalLayer
         x_B_T_H_W_D = rearrange(x_B_L_D, "b (t h w) d -> b t h w d", t=video_size.T, h=video_size.H, w=video_size.W)

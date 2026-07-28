@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import lru_cache
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 import torch
 from torch import Tensor
@@ -38,10 +38,60 @@ def rewrite_mask_mod_for_cp(
     mask_mod: _mask_mod_signature,
     rank: int,
     shard_size: int,
+    world_size: int = 1,
+    valid_shard_size: Optional[int] = None,
+    cp_layout: Literal["contiguous", "zigzag"] = "contiguous",
 ) -> _mask_mod_signature:
-    # since we're sharding on `seq_dim`, global q_idx is mapped to q_idx % shard_size
-    # on each rank which means q_idx = q_idx_on_rank + shard_size * rank
-    return lambda b, h, q_idx, kv_idx: mask_mod(b, h, q_idx + rank * shard_size, kv_idx)
+    """Map local/physical CP indices back to the mask's contiguous layout."""
+    if cp_layout == "contiguous":
+        # Since we're sharding on `seq_dim`, global q_idx is mapped to
+        # q_idx % shard_size on each rank.
+        return lambda b, h, q_idx, kv_idx: mask_mod(b, h, q_idx + rank * shard_size, kv_idx)
+    if cp_layout != "zigzag":
+        raise ValueError(f"Unknown CP layout {cp_layout!r}; expected 'contiguous' or 'zigzag'")
+    if valid_shard_size is None:
+        valid_shard_size = shard_size
+    if valid_shard_size <= 0 or valid_shard_size > shard_size:
+        raise ValueError(f"valid_shard_size must be in [1, shard_size], got {valid_shard_size=} and {shard_size=}")
+    if valid_shard_size % 2 != 0:
+        raise ValueError(
+            "Zigzag CP requires each unpadded rank-local sequence to contain two equal micro-chunks, "
+            f"got local length {valid_shard_size}"
+        )
+
+    micro_chunk_size = valid_shard_size // 2
+
+    def zigzag_mask_mod(b, h, q_idx, kv_idx):
+        # Query is local to this rank.  Padding is appended after both valid
+        # zigzag chunks, so map invalid positions to a safe index before
+        # evaluating the original mask and gate them out afterwards.
+        q_valid = q_idx < valid_shard_size
+        q_off = torch.where(q_valid, q_idx, 0)
+        q_logical = torch.where(
+            q_off < micro_chunk_size,
+            rank * micro_chunk_size + q_off,
+            (2 * world_size - rank - 1) * micro_chunk_size + q_off - micro_chunk_size,
+        )
+
+        # K/V were all-gathered in rank order.  Convert their physical
+        # [front_chunk, back_chunk, padding] layout to logical sequence indices.
+        kv_source_rank = kv_idx // shard_size
+        kv_source_off = kv_idx % shard_size
+        kv_valid = kv_source_off < valid_shard_size
+        kv_off = torch.where(kv_valid, kv_source_off, 0)
+        kv_logical = torch.where(
+            kv_off < micro_chunk_size,
+            kv_source_rank * micro_chunk_size + kv_off,
+            (2 * world_size - kv_source_rank - 1) * micro_chunk_size + kv_off - micro_chunk_size,
+        )
+
+        # The source mask was built for contiguous CP with per-rank padding.
+        # Convert logical indices to that physical coordinate system.
+        q_contiguous = (q_logical // valid_shard_size) * shard_size + q_logical % valid_shard_size
+        kv_contiguous = (kv_logical // valid_shard_size) * shard_size + kv_logical % valid_shard_size
+        return q_valid & kv_valid & mask_mod(b, h, q_contiguous, kv_contiguous)
+
+    return zigzag_mask_mod
 
 
 def flex_attention_cp(
@@ -53,6 +103,8 @@ def flex_attention_cp(
     block_mask: Optional[BlockMask] = None,
     flex_attention_fn: Callable = flex_attention,
     seq_dim: int = 2,  # sharding on this dimension
+    cp_layout: Literal["contiguous", "zigzag"] = "contiguous",
+    local_sequence_length: Optional[int] = None,
     **kwargs,
 ) -> Tensor:
     """Extend flex attention to support context parallel (CP)."""
@@ -106,9 +158,15 @@ def flex_attention_cp(
             v_full = v_local.full_tensor(grad_placements=[Partial()])
 
         # rewrite `block_mask`
-        cp_mask_mod = rewrite_mask_mod_for_cp(mask_mod, local_rank, shard_size)
+        cp_mask_mod = rewrite_mask_mod_for_cp(
+            mask_mod,
+            local_rank,
+            shard_size,
+            world_size=world_size,
+            valid_shard_size=local_sequence_length,
+            cp_layout=cp_layout,
+        )
         cp_block_mask = create_block_mask_cached(cp_mask_mod, B=1, H=1, M=shard_size, N=seq_len, device=device_type)
-
 
         cp_out = flex_attention_fn(
             q_local,

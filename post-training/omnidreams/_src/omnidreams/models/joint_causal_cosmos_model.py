@@ -227,6 +227,17 @@ class CausalJointCosmosModel(Text2WorldModelRectifiedFlow):
         cp_group = self.get_context_parallel_group()
         cp_size = 1 if cp_group is None else cp_group.size()
         if condition.is_video and cp_size > 1:
+            training_cp_strategy = getattr(self.net, "training_context_parallel_strategy", "contiguous")
+            training_attention_backend = getattr(self.net, "training_attention_backend", "flex")
+            requires_full_sequence = (
+                training_cp_strategy != "contiguous" or training_attention_backend == "flash_attn_3"
+            )
+            if requires_full_sequence and self.config.split_cp_in_model:
+                raise ValueError(
+                    f"training_attention_backend={training_attention_backend!r} with "
+                    f"training_context_parallel_strategy={training_cp_strategy!r} requires "
+                    "model.config.split_cp_in_model=false so the causal network can partition the full token sequence"
+                )
             if x0_B_C_T_H_W is not None:
                 if self.config.split_cp_in_model:
                     x0_B_C_T_H_W = broadcast_split_tensor(x0_B_C_T_H_W, seq_dim=2, process_group=cp_group)

@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
-from typing import Optional
+from functools import lru_cache
+from typing import Literal, Optional
 
 try:
     import megatron.core.parallel_state as parallel_state
@@ -19,7 +20,59 @@ from torch.distributed.utils import _verify_param_shape_across_processes
 from omnidreams._src.imaginaire.utils import distributed
 
 
-def split_inputs_cp(x: Tensor, seq_dim: int, cp_group: ProcessGroup) -> Tensor:
+ContextParallelLayout = Literal["contiguous", "zigzag"]
+
+
+def _validate_cp_layout(layout: ContextParallelLayout) -> None:
+    if layout not in {"contiguous", "zigzag"}:
+        raise ValueError(f"Unknown context-parallel layout {layout!r}; expected 'contiguous' or 'zigzag'")
+
+
+@lru_cache(maxsize=128)
+def _zigzag_restore_index(cp_size: int, device_type: str, device_index: Optional[int]) -> Tensor:
+    """Return a reusable logical-order index without repeated host-to-device copies."""
+    num_chunks = 2 * cp_size
+    logical_to_physical = tuple(
+        2 * logical_idx if logical_idx < cp_size else 2 * (num_chunks - logical_idx - 1) + 1
+        for logical_idx in range(num_chunks)
+    )
+    device = torch.device(device_type) if device_index is None else torch.device(device_type, device_index)
+    return torch.tensor(logical_to_physical, dtype=torch.long, device=device)
+
+
+def restore_zigzag_sequence_order(x: Tensor, seq_dim: int, cp_size: int) -> Tensor:
+    """Restore chronological order after gathering zigzag CP shards.
+
+    Zigzag rank ``r`` owns global micro-chunks ``r`` and
+    ``2 * cp_size - r - 1``.  A rank-order all-gather therefore produces the
+    physical chunk order ``[0, 2P-1, 1, 2P-2, ...]``; this helper applies the
+    inverse permutation.
+    """
+    num_chunks = 2 * cp_size
+    if x.shape[seq_dim] % num_chunks != 0:
+        raise ValueError(
+            "A zigzag CP gather requires the sequence length to be divisible by "
+            f"2 * cp_size ({num_chunks}), got {x.shape[seq_dim]}"
+        )
+
+    chunk_size = x.shape[seq_dim] // num_chunks
+    chunked = x.reshape(
+        *x.shape[:seq_dim],
+        num_chunks,
+        chunk_size,
+        *x.shape[(seq_dim + 1) :],
+    )
+    index = _zigzag_restore_index(cp_size, x.device.type, x.device.index)
+    ordered = chunked.index_select(seq_dim, index)
+    return ordered.reshape(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 1) :])
+
+
+def split_inputs_cp(
+    x: Tensor,
+    seq_dim: int,
+    cp_group: ProcessGroup,
+    layout: ContextParallelLayout = "contiguous",
+) -> Tensor:
     """
     Split input tensor along the sequence dimension for checkpoint parallelism.
 
@@ -30,7 +83,11 @@ def split_inputs_cp(x: Tensor, seq_dim: int, cp_group: ProcessGroup) -> Tensor:
     Args:
         x: Input tensor to be split.
         seq_dim: The dimension along which to split the input (sequence dimension).
-        cp_group: The process group for checkpoint parallelism.
+        cp_group: The process group for context parallelism.
+        layout: ``contiguous`` assigns one consecutive shard to each rank.
+            ``zigzag`` divides the sequence into ``2 * cp_size`` equal
+            micro-chunks and assigns the symmetric pair
+            ``(rank, 2 * cp_size - rank - 1)`` to each rank.
 
     Returns:
         A slice of the input tensor corresponding to the current rank.
@@ -38,12 +95,19 @@ def split_inputs_cp(x: Tensor, seq_dim: int, cp_group: ProcessGroup) -> Tensor:
     Raises:
         AssertionError: If the sequence dimension is not divisible by the number of ranks.
     """
+    _validate_cp_layout(layout)
     cp_ranks = get_process_group_ranks(cp_group)
     cp_size = len(cp_ranks)
 
-    assert x.shape[seq_dim] % cp_size == 0, f"{x.shape[seq_dim]} cannot divide cp_size {cp_size}"
-    x = x.view(*x.shape[:seq_dim], cp_size, x.shape[seq_dim] // cp_size, *x.shape[(seq_dim + 1) :])
-    seq_idx = torch.tensor([cp_group.rank()], device=x.device)
+    num_chunks = cp_size if layout == "contiguous" else 2 * cp_size
+    assert x.shape[seq_dim] % num_chunks == 0, f"{x.shape[seq_dim]} cannot divide {num_chunks} CP chunks"
+    x = x.view(*x.shape[:seq_dim], num_chunks, x.shape[seq_dim] // num_chunks, *x.shape[(seq_dim + 1) :])
+    rank = cp_group.rank()
+    if layout == "contiguous":
+        selected_chunks = [rank]
+    else:
+        selected_chunks = [rank, num_chunks - rank - 1]
+    seq_idx = torch.tensor(selected_chunks, dtype=torch.long, device=x.device)
     x = x.index_select(seq_dim, seq_idx)
     # Note that the new sequence length is the original sequence length / cp_size
     x = x.view(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :])
@@ -51,7 +115,12 @@ def split_inputs_cp(x: Tensor, seq_dim: int, cp_group: ProcessGroup) -> Tensor:
 
 
 @torch.compiler.disable
-def cat_outputs_cp(x: Tensor, seq_dim: int, cp_group: ProcessGroup) -> Tensor:
+def cat_outputs_cp(
+    x: Tensor,
+    seq_dim: int,
+    cp_group: ProcessGroup,
+    layout: ContextParallelLayout = "contiguous",
+) -> Tensor:
     """
     Concatenate outputs from different ranks in the checkpoint parallelism group.
 
@@ -65,7 +134,8 @@ def cat_outputs_cp(x: Tensor, seq_dim: int, cp_group: ProcessGroup) -> Tensor:
     Args:
         x: Input tensor to be concatenated.
         seq_dim: The dimension along which to concatenate the tensors (sequence dimension).
-        cp_group: The process group for checkpoint parallelism.
+        cp_group: The process group for context parallelism.
+        layout: Layout used when the inputs were split.
 
     Returns:
         A tensor that is the concatenation of tensors from all ranks in the cp_group.
@@ -73,6 +143,7 @@ def cat_outputs_cp(x: Tensor, seq_dim: int, cp_group: ProcessGroup) -> Tensor:
     Raises:
         RuntimeError: If the gather operation fails.
     """
+    _validate_cp_layout(layout)
     # Get the world size (number of processes in the group)
     world_size = get_world_size(cp_group)
 
@@ -85,11 +156,19 @@ def cat_outputs_cp(x: Tensor, seq_dim: int, cp_group: ProcessGroup) -> Tensor:
     except RuntimeError as e:
         raise RuntimeError(f"Failed to gather tensors: {e}")
 
-    # Concatenate the gathered tensors along the specified dimension
-    return torch.cat(gathered_tensors, dim=seq_dim)
+    # Concatenate the gathered tensors along the specified dimension.
+    output = torch.cat(gathered_tensors, dim=seq_dim)
+    if layout == "zigzag":
+        output = restore_zigzag_sequence_order(output, seq_dim=seq_dim, cp_size=world_size)
+    return output
 
 
-def cat_outputs_cp_with_grad(x: Tensor, seq_dim: int, cp_group: ProcessGroup) -> Tensor:
+def cat_outputs_cp_with_grad(
+    x: Tensor,
+    seq_dim: int,
+    cp_group: ProcessGroup,
+    layout: ContextParallelLayout = "contiguous",
+) -> Tensor:
     """
     Concatenate outputs from different ranks in the context parallelism group.
 
@@ -101,7 +180,8 @@ def cat_outputs_cp_with_grad(x: Tensor, seq_dim: int, cp_group: ProcessGroup) ->
     Args:
         x: Input tensor to be concatenated.
         seq_dim: The dimension along which to concatenate the tensors (sequence dimension).
-        cp_group: The process group for checkpoint parallelism.
+        cp_group: The process group for context parallelism.
+        layout: Layout used when the inputs were split.
 
     Returns:
         A tensor that is the concatenation of tensors from all ranks in the cp_group.
@@ -109,6 +189,7 @@ def cat_outputs_cp_with_grad(x: Tensor, seq_dim: int, cp_group: ProcessGroup) ->
     Raises:
         RuntimeError: If the gather operation fails.
     """
+    _validate_cp_layout(layout)
     # Get the world size (number of processes in the group)
     cp_size = cp_group.size()
     assert cp_size > 0, "cp_size should be greater than 0"
@@ -124,8 +205,11 @@ def cat_outputs_cp_with_grad(x: Tensor, seq_dim: int, cp_group: ProcessGroup) ->
 
     rank = cp_group.rank()
     gathered_tensors[rank] = x
-    # Concatenate the gathered tensors along the specified dimension
-    return torch.cat(gathered_tensors, dim=seq_dim)
+    # Concatenate the gathered tensors along the specified dimension.
+    output = torch.cat(gathered_tensors, dim=seq_dim)
+    if layout == "zigzag":
+        output = restore_zigzag_sequence_order(output, seq_dim=seq_dim, cp_size=cp_size)
+    return output
 
 
 @torch.compiler.disable

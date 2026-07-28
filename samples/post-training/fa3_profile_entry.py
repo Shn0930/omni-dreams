@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Training entry point used by the reproducible CP=1 FA3 A/B profile."""
+"""Training entry point used by reproducible causal-attention A/B profiles."""
 
 from __future__ import annotations
 
