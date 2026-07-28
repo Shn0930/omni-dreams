@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Correctness tests for the CP=1 FlashAttention-3 block-causal backend."""
+"""Correctness tests for the full-sequence FlashAttention-3 block-causal backend."""
 
 import math
 

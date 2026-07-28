@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Four-rank forward/gradient oracle for CP attention layouts.
+"""Configurable-rank forward/gradient oracle for CP attention layouts.
 
 Run from ``post-training`` in the FA3 environment:
 
-    torchrun --standalone --nproc-per-node=4 \
+    torchrun --standalone --nproc-per-node=<CP_SIZE> \
       ../samples/post-training/tests/torchrun_cp_attention_correctness.py
 """
 
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -46,7 +47,8 @@ def _gather_output(x: torch.Tensor, world_size: int, layout: str) -> torch.Tenso
 
 
 def _test_a2a_identity(device: torch.device, rank: int, world_size: int) -> None:
-    batch, local_sequence, heads, head_dim = 1, 6, 8, 4
+    batch, local_sequence, head_dim = 1, 6, 4
+    heads = world_size * math.ceil(8 / world_size)
     global_sequence = local_sequence * world_size
     global_x = torch.arange(
         batch * global_sequence * heads * head_dim,
@@ -77,8 +79,16 @@ def _test_distributed_flash3(
     world_size: int,
     strategy: str,
 ) -> None:
-    batch, sequence, heads, head_dim = 1, 96, 8, 64
+    batch, head_dim = 1, 64
+    sequence = 2 * world_size * math.ceil(96 / (2 * world_size))
+    heads = world_size * math.ceil(8 / world_size)
     tokens_per_block = 8
+    if sequence % (2 * world_size) != 0:
+        raise RuntimeError(
+            f"sequence={sequence} must be divisible by 2 * CP_SIZE={2 * world_size}"
+        )
+    if heads % world_size != 0:
+        raise RuntimeError(f"heads={heads} must be divisible by CP_SIZE={world_size}")
     generator = torch.Generator(device=device).manual_seed(20260728)
     global_inputs = [
         torch.randn(
@@ -145,12 +155,10 @@ def _test_distributed_flash3(
 
 
 def main() -> None:
-    if int(os.environ["WORLD_SIZE"]) != 4:
-        raise RuntimeError("This correctness oracle requires exactly four ranks")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl")
     device = torch.device("cuda", local_rank)
+    dist.init_process_group("nccl", device_id=device)
 
     try:
         _test_a2a_identity(device, dist.get_rank(), dist.get_world_size())
@@ -158,7 +166,10 @@ def main() -> None:
             dist.barrier()
             _test_distributed_flash3(device, dist.get_rank(), dist.get_world_size(), strategy)
             if dist.get_rank() == 0:
-                print(f"PASS: {strategy} CP=4 forward and gradients", flush=True)
+                print(
+                    f"PASS: {strategy} CP={dist.get_world_size()} forward and gradients",
+                    flush=True,
+                )
     finally:
         dist.destroy_process_group()
 

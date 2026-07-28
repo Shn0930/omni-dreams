@@ -2,12 +2,17 @@
 
 日期：2026-07-28
 
+> 本报告记录的是 `NPROC=4, CP_SIZE=4, FSDP_SIZE=4` 的历史 benchmark。
+> CP=4 是本报告的测量配置，不是实现限制；runtime 与 launcher 的 CP size、进程数和
+> FSDP shard size 均可由用户配置。
+
 运行和配置说明见
-[CP=4 Zigzag / Ulysses 使用指南](./CP4_CONTEXT_PARALLEL_USAGE.md)。
+[可配置 Context Parallel Zigzag / Ulysses 使用指南](./CONTEXT_PARALLEL_USAGE.md)。
 
 ## 结论
 
-本分支在单视角 causal training 路径中实现了两种 CP=4 负载均衡策略：
+本分支在单视角 causal training 路径中实现了两种可配置 CP 负载均衡策略；本报告使用
+CP=4 对它们进行测量：
 
 - **Zigzag CP**：每个 rank 持有首尾对称的两个 sequence micro-chunk，继续采用 local-Q、full-K/V 的 query-sharded attention。
 - **Ulysses CP**：在 self-attention 内通过 all-to-all 将 sequence shard 临时转换为 head shard，计算完整 causal sequence 后再转换回来。
@@ -262,19 +267,28 @@ perf/cp4-ulysses-zigzag-20260728
 
 ```bash
 CUDA_VISIBLE_DEVICES=1,2,3,4 \
+NPROC=4 \
+CP_SIZE=4 \
+FSDP_SIZE=4 \
 PROFILE_DATA_ROOT=/path/to/df93 \
-bash samples/post-training/run_cp4_attention_ab.sh fa3-contiguous
+bash samples/post-training/run_cp_attention_ab.sh fa3-contiguous
 
 CUDA_VISIBLE_DEVICES=1,2,3,4 \
+NPROC=4 \
+CP_SIZE=4 \
+FSDP_SIZE=4 \
 PROFILE_DATA_ROOT=/path/to/df93 \
-bash samples/post-training/run_cp4_attention_ab.sh fa3-zigzag
+bash samples/post-training/run_cp_attention_ab.sh fa3-zigzag
 
 CUDA_VISIBLE_DEVICES=1,2,3,4 \
+NPROC=4 \
+CP_SIZE=4 \
+FSDP_SIZE=4 \
 PROFILE_DATA_ROOT=/path/to/df93 \
-bash samples/post-training/run_cp4_attention_ab.sh fa3-ulysses
+bash samples/post-training/run_cp_attention_ab.sh fa3-ulysses
 ```
 
-四卡数值 oracle：
+四卡数值 oracle（用于复现本报告；该脚本也支持其他 world size）：
 
 ```bash
 export OMNI_CACHE_DIR=/path/to/cache

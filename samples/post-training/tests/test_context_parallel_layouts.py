@@ -29,12 +29,17 @@ def test_ulysses_attention_strategy_requires_flash3() -> None:
         )
 
 
-def test_zigzag_split_and_inverse_gather(monkeypatch: pytest.MonkeyPatch) -> None:
-    cp_size = 4
+@pytest.mark.parametrize("cp_size", [1, 2, 3, 4, 8])
+def test_zigzag_split_and_inverse_gather(
+    monkeypatch: pytest.MonkeyPatch,
+    cp_size: int,
+) -> None:
     monkeypatch.setattr(
         context_parallel, "get_process_group_ranks", lambda group: list(range(cp_size))
     )
-    full = torch.arange(2 * 32 * 3).reshape(2, 32, 3)
+    micro_chunk_size = 4
+    full_sequence = 2 * cp_size * micro_chunk_size
+    full = torch.arange(2 * full_sequence * 3).reshape(2, full_sequence, 3)
 
     shards = [
         context_parallel.split_inputs_cp(
@@ -46,10 +51,10 @@ def test_zigzag_split_and_inverse_gather(monkeypatch: pytest.MonkeyPatch) -> Non
         for rank in range(cp_size)
     ]
 
-    expected_chunk_ids = ((0, 7), (1, 6), (2, 5), (3, 4))
-    chunks = full.reshape(2, 2 * cp_size, 4, 3)
+    expected_chunk_ids = tuple((rank, 2 * cp_size - rank - 1) for rank in range(cp_size))
+    chunks = full.reshape(2, 2 * cp_size, micro_chunk_size, 3)
     for shard, chunk_ids in zip(shards, expected_chunk_ids, strict=True):
-        expected = chunks[:, list(chunk_ids)].reshape(2, 8, 3)
+        expected = chunks[:, list(chunk_ids)].reshape(2, 2 * micro_chunk_size, 3)
         torch.testing.assert_close(shard, expected)
 
     physical_rank_order = torch.cat(shards, dim=1)
@@ -61,19 +66,35 @@ def test_zigzag_split_and_inverse_gather(monkeypatch: pytest.MonkeyPatch) -> Non
     torch.testing.assert_close(restored, full)
 
 
-def test_zigzag_restore_is_differentiable() -> None:
-    cp_size = 4
-    logical = torch.arange(16, dtype=torch.float32)
-    physical_to_logical = torch.tensor([0, 7, 1, 6, 2, 5, 3, 4])
-    physical = (
-        logical.reshape(8, 2).index_select(0, physical_to_logical).reshape(16).requires_grad_(True)
+@pytest.mark.parametrize("cp_size", [1, 2, 3, 4, 8])
+def test_zigzag_restore_is_differentiable(cp_size: int) -> None:
+    micro_chunk_size = 2
+    num_micro_chunks = 2 * cp_size
+    sequence = num_micro_chunks * micro_chunk_size
+    logical = torch.arange(sequence, dtype=torch.float32)
+    physical_to_logical = torch.tensor(
+        [
+            chunk
+            for rank in range(cp_size)
+            for chunk in (rank, num_micro_chunks - rank - 1)
+        ]
     )
-    weights = torch.arange(1, 17, dtype=torch.float32)
+    physical = (
+        logical.reshape(num_micro_chunks, micro_chunk_size)
+        .index_select(0, physical_to_logical)
+        .reshape(sequence)
+        .requires_grad_(True)
+    )
+    weights = torch.arange(1, sequence + 1, dtype=torch.float32)
 
     restored = context_parallel.restore_zigzag_sequence_order(physical, seq_dim=0, cp_size=cp_size)
     (restored * weights).sum().backward()
 
-    expected_grad = weights.reshape(8, 2).index_select(0, physical_to_logical).reshape(16)
+    expected_grad = (
+        weights.reshape(num_micro_chunks, micro_chunk_size)
+        .index_select(0, physical_to_logical)
+        .reshape(sequence)
+    )
     torch.testing.assert_close(physical.grad, expected_grad)
 
 
@@ -89,8 +110,8 @@ def test_zigzag_restore_reuses_permutation_index() -> None:
     assert cache_info.hits == 1
 
 
-def test_zigzag_flex_mask_mapping_with_rank_padding() -> None:
-    cp_size = 4
+@pytest.mark.parametrize("cp_size", [1, 2, 3, 4, 8])
+def test_zigzag_flex_mask_mapping_with_rank_padding(cp_size: int) -> None:
     valid_shard_size = 6
     padded_shard_size = 8
     tokens_per_block = 4

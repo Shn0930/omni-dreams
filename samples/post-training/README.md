@@ -137,15 +137,24 @@ commented placeholders for `--account` and `--partition`. Either pass them
 on the `sbatch` command line, or uncomment and edit the `##SBATCH` lines at
 the top of the file.
 
-### Optional CP=1 FlashAttention-3 profiling
+### Optional configurable FlashAttention-3 profiling
 
-`run_fa3_cp1_ab.sh` compares the existing FlexAttention path, the CP=1
-block-causal FlashAttention-3 path, and FlashAttention-3 with the existing
-aggressive selective-activation-checkpoint policy. This is a four-GPU
-profiling workflow, separate from the supported 8-GPU smoke experiments
-above.
+The single-node profiling launchers are configurable rather than tied to a
+particular GPU count:
 
-The FA3 path currently requires four x86_64 Hopper (SM90) GPUs, CP=1/FSDP=4,
+- `run_fa3_attention_ab.sh` compares `flex`, `fa3`, and `fa3-sac` while using
+  the contiguous CP layout.
+- `run_cp_attention_ab.sh` compares `flex-contiguous`, `flex-zigzag`,
+  `fa3-contiguous`, `fa3-zigzag`, and `fa3-ulysses`.
+
+Set `NPROC`, `CP_SIZE`, and `FSDP_SIZE` for the topology being measured.
+When omitted, `NPROC` is inferred from `CUDA_VISIBLE_DEVICES`; the launchers
+do not require exactly four GPUs. `CP_SIZE` and `FSDP_SIZE` must each divide
+`NPROC`. CP=1 and CP=4 below are examples and validated comparison points,
+not hard-coded limits. These profiling launchers are separate from the
+supported 8-GPU smoke experiments above.
+
+The FA3 path currently requires x86_64 Hopper (SM90) GPUs,
 `patch_temporal=1`, and a non-interleaved single-view model. Its validated
 software stack is Python 3.13, PyTorch 2.10, CUDA 12.8, Transformer Engine
 2.12, and `flash-attn-3-nv` 1.0.3. Create that environment from the pinned
@@ -171,58 +180,78 @@ uv pip install --python "$OMNI_FA3_VENV/bin/python" \
 
 Run `setup_env.sh` first to stage the standard 93-frame sample dataset, or
 set `PROFILE_DATA_ROOT` to another dataset with the layout documented below.
-The three modes keep the dataset and FSDP configuration fixed:
+For a fair A/B comparison, keep `NPROC`, `CP_SIZE`, `FSDP_SIZE`, the dataset,
+and the checkpoint fixed across modes.
 
 ```bash
+# CP=1/FSDP=4 on four GPUs is one example.
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-  bash samples/post-training/run_fa3_cp1_ab.sh flex
+  NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
+  bash samples/post-training/run_fa3_attention_ab.sh flex
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-  bash samples/post-training/run_fa3_cp1_ab.sh fa3
+  NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
+  bash samples/post-training/run_fa3_attention_ab.sh fa3
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-  bash samples/post-training/run_fa3_cp1_ab.sh fa3-sac
+  NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
+  bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
 
 # Add an Nsight Systems capture when nsys is on PATH.
 CUDA_VISIBLE_DEVICES=0,1,2,3 NSYS=1 \
-  bash samples/post-training/run_fa3_cp1_ab.sh fa3-sac
+  NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
+  bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
 ```
 
 `flash-attn-3-nv` is a BSD-3-Clause dependency supplied by the pinned Cosmos
-Framework lock. This CP=1 launcher keeps context parallelism disabled; the
-distributed single-view FA3 paths are covered by the CP=4 workflow below.
+Framework lock. A run with `CP_SIZE=1` keeps context parallelism disabled;
+larger CP groups use the distributed single-view FA3 path.
 Interleaved layouts, cross-view models, non-SM90 GPUs, and unsupported dtypes
 still fail fast.
 
-### Optional CP=4 FA3 Ulysses / Zigzag profiling
+### Configurable context-parallel layout comparison
 
-`run_cp4_attention_ab.sh` keeps CP=4/FSDP=4, FA3, SAC, data, and checkpoint
-fixed while changing only the training CP strategy:
+`run_cp_attention_ab.sh` changes the attention backend and/or CP strategy.
+Keep the remaining topology and training inputs fixed when comparing modes.
 
 Start with the dedicated
-[CP=4 Zigzag / Ulysses usage guide](./CP4_CONTEXT_PARALLEL_USAGE.md) for the
+[context-parallel Zigzag / Ulysses usage guide](./CONTEXT_PARALLEL_USAGE.md) for the
 supported scope, FA3 environment, strategy selection, launcher options,
 correctness tests, and troubleshooting.
 
 ```bash
+# CP=4/FSDP=4 on four GPUs is a measured example.
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-  bash samples/post-training/run_cp4_attention_ab.sh fa3-contiguous
+  NPROC=4 CP_SIZE=4 FSDP_SIZE=4 \
+  bash samples/post-training/run_cp_attention_ab.sh fa3-contiguous
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-  bash samples/post-training/run_cp4_attention_ab.sh fa3-zigzag
+  NPROC=4 CP_SIZE=4 FSDP_SIZE=4 \
+  bash samples/post-training/run_cp_attention_ab.sh fa3-zigzag
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
-  bash samples/post-training/run_cp4_attention_ab.sh fa3-ulysses
+  NPROC=4 CP_SIZE=4 FSDP_SIZE=4 \
+  bash samples/post-training/run_cp_attention_ab.sh fa3-ulysses
+
+# The GPU count and CP/FSDP topology are user-selectable; for example CP=4
+# within an eight-process job.
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  NPROC=8 CP_SIZE=4 FSDP_SIZE=8 \
+  bash samples/post-training/run_cp_attention_ab.sh fa3-ulysses
 
 # Capture clean iterations after the tokenizer's one-time compile step.
 CUDA_VISIBLE_DEVICES=0,1,2,3 NSYS=1 \
-  bash samples/post-training/run_cp4_attention_ab.sh fa3-ulysses
+  NPROC=4 CP_SIZE=4 FSDP_SIZE=4 \
+  bash samples/post-training/run_cp_attention_ab.sh fa3-ulysses
 ```
 
 This validated experimental profiling workflow covers non-interleaved,
-single-view causal training, requires SM90, and was measured on four H20-3e
-GPUs. It also requires `split_cp_in_model=false`. The launcher disables
-validation and checkpoint writes, so it must not be used as a production
-training launcher. Ulysses additionally requires `num_heads % cp_size == 0`.
-See the
+single-view causal training, requires SM90 for FA3 modes, and has measured
+CP=1 and CP=4 comparison points (including four H20-3e GPUs). It also requires
+`split_cp_in_model=false`. The launcher disables validation and checkpoint
+writes, so it must not be used as a production training launcher. Ulysses
+additionally requires `num_heads % CP_SIZE == 0`. All CP layouts require the
+global sequence to divide by `CP_SIZE`; Zigzag strengthens this to divisibility
+by `2 * CP_SIZE`. See the
 [implementation and performance report](./CP4_ULYSSES_ZIGZAG_REPORT.md) for
-the layout, correctness checks, benchmark method, and measured results.
+the historical CP=4 layout, correctness checks, benchmark method, and measured
+results.
 
 ## Required env on compute nodes
 
@@ -253,13 +282,18 @@ Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.
   `TRITON_CACHE_BASE` to `/tmp/triton_$JOB_ID`, then `exec`s `torchrun_smoke.sh`.
 - `triton_per_rank_wrap.sh` — torchrun `--no-python` shim that appends
   `_${LOCAL_RANK}` to `TRITON_CACHE_BASE` so 8 ranks never share a hash dir.
-- `run_cp4_attention_ab.sh` — four-GPU CP=4 launcher for FA3 Contiguous,
-  Zigzag, and Ulysses correctness/performance profiling.
-- `CP4_CONTEXT_PARALLEL_USAGE.md` — user-facing setup, configuration,
-  launch, validation, profiling, and troubleshooting guide for CP=4 Zigzag
-  and Ulysses.
+- `run_fa3_attention_ab.sh` — configurable single-node FlexAttention / FA3 /
+  FA3+SAC component A/B launcher using the contiguous layout.
+- `run_cp_attention_ab.sh` — configurable single-node Contiguous / Zigzag /
+  Ulysses context-parallel correctness and performance launcher.
+- `run_fa3_cp1_ab.sh` and `run_cp4_attention_ab.sh` — compatibility wrappers
+  that retain the old CP=1 and CP=4 defaults without fixing `NPROC` or
+  `FSDP_SIZE`; callers can migrate to the configurable launchers above.
+- `CONTEXT_PARALLEL_USAGE.md` — user-facing setup, configuration, launch,
+  validation, profiling, and troubleshooting guide for configurable Zigzag
+  and Ulysses runs.
 - `CP4_ULYSSES_ZIGZAG_REPORT.md` — implementation, two-run A/B, memory, and
-  all-rank nsys findings for the CP=4 strategies.
+  all-rank nsys findings for the historical CP=4 benchmark.
 - `prepare.py` — `snapshot_download`s the HF sample dataset and symlinks its
   per-scene files into the per-camera layout the dataloader expects. Invoked
   by `setup_env.sh`.
