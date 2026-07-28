@@ -13,7 +13,20 @@ from omnidreams._src.imaginaire.utils.callback import NVTXCallback
 FIRST = int(os.environ.get("OMNI_PROFILE_FIRST", "6"))
 LAST = int(os.environ.get("OMNI_PROFILE_LAST", "8"))
 CAPTURE = os.environ.get("OMNI_PROFILE_CAPTURE", "0") == "1"
+CUSTOM_PREFIX_GRAD_VALUE = os.environ.get("OMNI_FA3_CUSTOM_PREFIX_GRAD", "0")
+if CUSTOM_PREFIX_GRAD_VALUE not in {"0", "1"}:
+    raise ValueError(
+        f"OMNI_FA3_CUSTOM_PREFIX_GRAD must be 0 or 1, got {CUSTOM_PREFIX_GRAD_VALUE!r}"
+    )
+CUSTOM_PREFIX_GRAD = CUSTOM_PREFIX_GRAD_VALUE == "1"
 _original_after_backward = NVTXCallback.on_after_backward
+
+if CUSTOM_PREFIX_GRAD:
+    from optimized_block_causal_flash_attention import (
+        install_optimized_block_causal_flash_attention,
+    )
+
+    install_optimized_block_causal_flash_attention()
 
 
 def _range_call(name, function, *args, **kwargs):

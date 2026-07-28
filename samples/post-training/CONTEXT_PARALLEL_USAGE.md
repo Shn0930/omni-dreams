@@ -198,6 +198,31 @@ post-training/data/{video,hdmap,caption}/
 | `fa3` | FA3 | Contiguous | whole-block |
 | `fa3-sac` | FA3 | Contiguous | aggressive SAC |
 
+`run_fa3_attention_ab.sh` also exposes the experimental
+`OMNI_FA3_CUSTOM_PREFIX_GRAD=1` path for CP=1. It preserves the FA3 forward and
+causal prefix schedule, but uses a custom autograd function to write the last
+full-prefix K/V gradients directly and accumulate earlier ragged prefixes
+in-place. This removes generic `SliceBackward` full-sequence zero/copy/add
+work.
+
+The switch is intentionally narrow:
+
+- only `fa3` and `fa3-sac` are accepted;
+- `CP_SIZE` must be `1`;
+- `flash-attn-3-nv` must be 1.0.3.x because the implementation uses its
+  private `_flash_attn_backward` ABI;
+- `run_cp_attention_ab.sh` forces the switch off so an inherited shell value
+  cannot contaminate Contiguous/Zigzag/Ulysses comparisons.
+
+Example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
+OMNI_FA3_CUSTOM_PREFIX_GRAD=1 \
+  bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
+```
+
 ### 4.3 并行参数和默认值
 
 两个 launcher 都使用相同的并行参数：
@@ -308,6 +333,7 @@ NPROC=6 CP_SIZE=3 FSDP_SIZE=6 \
 | `NSYS_BIN` | 从 `PATH` 查找 | 自定义 `nsys` 可执行文件 |
 | `PROFILE_FIRST` | CP launcher: `7`; FA3 launcher: `6` | nsys capture 首个 iteration |
 | `PROFILE_LAST` | `MAX_ITER` | nsys capture 最后一个 iteration |
+| `OMNI_FA3_CUSTOM_PREFIX_GRAD` | `0` | 仅 FA3 launcher 的 CP=1 ragged-prefix gradient 实验；只接受 `0`/`1` |
 
 默认 artifact 路径随实际 `NPROC` 和 launcher 类型变化：
 
@@ -381,6 +407,7 @@ entry，并保留 validation/checkpointer。不要复用 `fa3_profile_entry.py`�
 | `networks/causal_cosmos_hdmap.py` | HDMap 网络的相同训练路径 |
 | `models/joint_causal_cosmos_model.py` | `split_cp_in_model` 防二次分片校验 |
 | `networks/causal_crossview_cosmos.py` | 明确拒绝尚未支持的 multiview 组合 |
+| `samples/post-training/optimized_block_causal_flash_attention.py` | sample-side CP=1 FA3 ragged-prefix custom autograd；不修改 release tree |
 
 ## 6. Nsight Systems profiling
 
@@ -407,6 +434,8 @@ CUDA/NVTX，不启用 CPU sampling、context-switch sampling 或 backtrace。
 - `train.log`；
 - `metadata.txt`：实际 NPROC/CP/FSDP、模式、版本、GPU 和源码 hash；
 - `git-status.txt` 和 `tracked-changes.patch`；
+- `source-snapshot/` 和 `source-snapshot.sha256`：FA3 profiling entry、
+  launcher 与 custom autograd 的精确源码快照；
 - `nvml.csv`：200 ms 显存/utilization 采样；
 - `timing_rank0.nsys-rep` 到 `timing_rank$((NPROC-1)).nsys-rep`
   （`NSYS=1` 时）。

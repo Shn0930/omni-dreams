@@ -139,6 +139,9 @@ export TRITON_CACHE_BASE="${TRITON_CACHE_BASE:-$OMNI_CACHE_DIR/triton/$JOB_NAME}
 export OMNI_PROFILE_FIRST="$PROFILE_FIRST"
 export OMNI_PROFILE_LAST="$PROFILE_LAST"
 export OMNI_PROFILE_CAPTURE="$NSYS"
+# The custom prefix-gradient autograd is currently a CP=1-only experiment.
+# Clear inherited shell state so CP strategy comparisons cannot be polluted.
+export OMNI_FA3_CUSTOM_PREFIX_GRAD=0
 
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/_env.sh"

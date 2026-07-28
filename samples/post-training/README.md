@@ -201,6 +201,24 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 NSYS=1 \
   bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
 ```
 
+For the optional CP=1 kernel-level experiment, enable direct ragged-prefix
+gradient accumulation:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
+  OMNI_FA3_CUSTOM_PREFIX_GRAD=1 \
+  bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
+```
+
+This keeps the same FA3 forward calls and block-causal mask, but replaces the
+generic autograd graph that expands every prefix gradient to the full sequence.
+It is disabled by default and currently fails fast unless the mode is `fa3` or
+`fa3-sac`, `CP_SIZE=1`, and `flash-attn-3-nv` is version 1.0.3.x. The
+implementation calls a private FA3 backward ABI; revalidate correctness and
+performance before changing that dependency. CP layout comparisons explicitly
+disable this switch.
+
 `flash-attn-3-nv` is a BSD-3-Clause dependency supplied by the pinned Cosmos
 Framework lock. A run with `CP_SIZE=1` keeps context parallelism disabled;
 larger CP groups use the distributed single-view FA3 path.
@@ -284,6 +302,9 @@ Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.
   `_${LOCAL_RANK}` to `TRITON_CACHE_BASE` so 8 ranks never share a hash dir.
 - `run_fa3_attention_ab.sh` — configurable single-node FlexAttention / FA3 /
   FA3+SAC component A/B launcher using the contiguous layout.
+- `optimized_block_causal_flash_attention.py` — optional CP=1 FA3 autograd
+  that accumulates ragged prefix gradients directly, avoiding generic
+  full-sequence slice-gradient materialization.
 - `run_cp_attention_ab.sh` — configurable single-node Contiguous / Zigzag /
   Ulysses context-parallel correctness and performance launcher.
 - `run_fa3_cp1_ab.sh` and `run_cp4_attention_ab.sh` — compatibility wrappers
@@ -294,6 +315,9 @@ Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.
   and Ulysses runs.
 - `CP4_ULYSSES_ZIGZAG_REPORT.md` — implementation, two-run A/B, memory, and
   all-rank nsys findings for the historical CP=4 benchmark.
+- `KERNEL_LEVEL_OPTIMIZATION_REPORT.md` — CP=1 NCU/NSYS kernel analysis,
+  custom ragged-prefix autograd implementation, correctness, and end-to-end
+  results.
 - `prepare.py` — `snapshot_download`s the HF sample dataset and symlinks its
   per-scene files into the per-camera layout the dataloader expects. Invoked
   by `setup_env.sh`.

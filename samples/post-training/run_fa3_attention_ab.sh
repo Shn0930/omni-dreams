@@ -124,6 +124,21 @@ export TRITON_CACHE_BASE="${TRITON_CACHE_BASE:-$OMNI_CACHE_DIR/triton/$JOB_NAME}
 export OMNI_PROFILE_FIRST="$PROFILE_FIRST"
 export OMNI_PROFILE_LAST="$PROFILE_LAST"
 export OMNI_PROFILE_CAPTURE="$NSYS"
+export OMNI_FA3_CUSTOM_PREFIX_GRAD="${OMNI_FA3_CUSTOM_PREFIX_GRAD:-0}"
+if [[ "$OMNI_FA3_CUSTOM_PREFIX_GRAD" != "0" && "$OMNI_FA3_CUSTOM_PREFIX_GRAD" != "1" ]]; then
+  echo "ERROR: OMNI_FA3_CUSTOM_PREFIX_GRAD must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$OMNI_FA3_CUSTOM_PREFIX_GRAD" == "1" ]]; then
+  if [[ "$ATTENTION_BACKEND" != "flash_attn_3" ]]; then
+    echo "ERROR: OMNI_FA3_CUSTOM_PREFIX_GRAD=1 requires mode fa3 or fa3-sac." >&2
+    exit 2
+  fi
+  if (( CP_SIZE != 1 )); then
+    echo "ERROR: OMNI_FA3_CUSTOM_PREFIX_GRAD=1 currently supports CP_SIZE=1 only." >&2
+    exit 2
+  fi
+fi
 
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/_env.sh"
@@ -159,9 +174,27 @@ fi
   echo "max_iter=$MAX_ITER"
   echo "profile_first=$PROFILE_FIRST"
   echo "profile_last=$PROFILE_LAST"
+  echo "custom_prefix_grad_requested=$OMNI_FA3_CUSTOM_PREFIX_GRAD"
+  echo "custom_prefix_grad_effective=$OMNI_FA3_CUSTOM_PREFIX_GRAD"
   echo "cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
-  echo "git_branch=$(git -C "$REPO_ROOT" branch --show-current)"
-  echo "git_head=$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  echo "profile_data_root=$PROFILE_DATA_ROOT"
+  find "$PROFILE_DATA_ROOT" -type l -printf 'dataset_link=%p -> %l\n' | sort
+  while IFS= read -r -d '' dataset_link; do
+    resolved_path="$(readlink -f "$dataset_link")"
+    if [[ -f "$resolved_path" ]]; then
+      echo "dataset_sha256=$(sha256sum "$resolved_path")"
+    fi
+  done < <(find "$PROFILE_DATA_ROOT" -type l -print0 | sort -z)
+  if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "git_branch=$(git -C "$REPO_ROOT" branch --show-current)"
+    echo "git_head=$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  else
+    echo "git_branch=unavailable"
+    echo "git_head=unavailable"
+  fi
+  for extra_arg in "${EXTRA_ARGS[@]}"; do
+    printf 'extra_arg=%q\n' "$extra_arg"
+  done
   echo "nsys=$NSYS"
   if [[ "$NSYS" == "1" ]]; then
     "$NSYS_BIN" --version | head -1
@@ -184,19 +217,28 @@ PY
   sha256sum \
     "$SCRIPT_DIR/fa3_env.sh" \
     "$SCRIPT_DIR/fa3_profile_entry.py" \
+    "$SCRIPT_DIR/optimized_block_causal_flash_attention.py" \
     "$SCRIPT_DIR/run_fa3_attention_ab.sh" \
     "$REPO_ROOT/post-training/omnidreams/_src/imaginaire/utils/context_parallel.py" \
     "$REPO_ROOT/post-training/omnidreams/_src/omnidreams/modules/block_causal_flash_attention.py" \
     "$REPO_ROOT/post-training/omnidreams/_src/omnidreams/networks/causal_cosmos.py" \
     "$REPO_ROOT/post-training/omnidreams/_src/omnidreams/networks/causal_cosmos_hdmap.py"
 } >"$ARTIFACT_DIR/metadata.txt"
-git -C "$REPO_ROOT" status --short >"$ARTIFACT_DIR/git-status.txt"
-git -C "$REPO_ROOT" diff HEAD -- \
-  post-training/omnidreams/_src/omnidreams/modules/block_causal_flash_attention.py \
-  post-training/omnidreams/_src/omnidreams/networks/causal_cosmos.py \
-  post-training/omnidreams/_src/omnidreams/networks/causal_cosmos_hdmap.py \
-  post-training/omnidreams/_src/omnidreams/networks/causal_crossview_cosmos.py \
-  >"$ARTIFACT_DIR/tracked-changes.patch"
+if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$REPO_ROOT" status --short >"$ARTIFACT_DIR/git-status.txt"
+  git -C "$REPO_ROOT" diff HEAD >"$ARTIFACT_DIR/tracked-changes.patch"
+else
+  echo "git metadata unavailable" >"$ARTIFACT_DIR/git-status.txt"
+  : >"$ARTIFACT_DIR/tracked-changes.patch"
+fi
+mkdir -p "$ARTIFACT_DIR/source-snapshot"
+for source_file in \
+  fa3_profile_entry.py \
+  optimized_block_causal_flash_attention.py \
+  run_fa3_attention_ab.sh; do
+  cp -a "$SCRIPT_DIR/$source_file" "$ARTIFACT_DIR/source-snapshot/$source_file"
+done
+sha256sum "$ARTIFACT_DIR/source-snapshot/"* >"$ARTIFACT_DIR/source-snapshot.sha256"
 
 WORKER=("$PYTHON" "$ENTRY")
 if [[ "$NSYS" == "1" ]]; then
