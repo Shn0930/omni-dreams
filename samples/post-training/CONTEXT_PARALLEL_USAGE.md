@@ -223,6 +223,38 @@ OMNI_FA3_CUSTOM_PREFIX_GRAD=1 \
   bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
 ```
 
+同一个 launcher 还提供两个独立的 CP=1 kernel 实验开关：
+
+- `OMNI_FA4_EXACT_BLOCK_CAUSAL=1`：用单次 FA4 CuTeDSL block-sparse
+  forward/backward 精确表示 lower-triangular logical-block mask；
+- `OMNI_OPTIMIZE_REPEATED_ADALN=1`：把每层三个 AdaLN-LoRA MLP 从
+  `[B,T×H×W,D]` 缩到 `[B,T,D]` 计算，再按空间 token 展开。
+
+FA4 与 custom prefix grad 会替换同一个 CP=1 binding，因此互斥；frame-level
+AdaLN 可以与任一 attention 路径组合。两项都只限制实验开关本身为
+`CP_SIZE=1`，不限制总 GPU 数；例如 `NPROC=8,FSDP_SIZE=8,CP_SIZE=1`
+仍是合法 topology。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
+OMNI_FA4_OVERLAY=/path/to/fa4-overlay \
+OMNI_FA4_ACCEPT_UNSUPPORTED_PROTOBUF7=1 \
+OMNI_FA4_EXACT_BLOCK_CAUSAL=1 \
+OMNI_OPTIMIZE_REPEATED_ADALN=1 \
+  bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
+```
+
+FA4 需要 Hopper SM90、完整 logical blocks、`tokens_per_block % 128 == 0`
+以及固定版本 `flash-attn-4==0.0.1.dev1+g14c377950`。由于固定的 CUTLASS
+DSL metadata 要求 protobuf<7，而仓库要求 protobuf>=7.35，FA4 只能通过
+独立 `--target` overlay 加显式 unsupported-metadata opt-in 运行；禁止降级
+共享 venv 的 protobuf。安装与 cache 配置见
+[README 的 FA4 说明](./README.md#optional-configurable-flashattention-3-profiling)。
+frame-level AdaLN 保持 state-dict key 不变，但 BF16 reduction 顺序改变后只
+保证数学等价，不承诺 bitwise gradient 一致；KV-cache chunk 必须按完整
+latent frame 对齐，否则会 fail-fast。
+
 ### 4.3 并行参数和默认值
 
 两个 launcher 都使用相同的并行参数：
@@ -334,6 +366,11 @@ NPROC=6 CP_SIZE=3 FSDP_SIZE=6 \
 | `PROFILE_FIRST` | CP launcher: `7`; FA3 launcher: `6` | nsys capture 首个 iteration |
 | `PROFILE_LAST` | `MAX_ITER` | nsys capture 最后一个 iteration |
 | `OMNI_FA3_CUSTOM_PREFIX_GRAD` | `0` | 仅 FA3 launcher 的 CP=1 ragged-prefix gradient 实验；只接受 `0`/`1` |
+| `OMNI_FA4_EXACT_BLOCK_CAUSAL` | `0` | CP=1 fused exact FA4 block-causal 实验；与 custom prefix grad 互斥 |
+| `OMNI_FA4_OVERLAY` | 未设置 | 位于 `OMNI_FA3_VENV` 外的 FA4 `--target` research overlay |
+| `OMNI_FA4_ACCEPT_UNSUPPORTED_PROTOBUF7` | `0` | 显式接受 CUTLASS DSL metadata 与仓库 protobuf 7 要求不一致；仅 research profiling |
+| `OMNI_OPTIMIZE_REPEATED_ADALN` | `0` | CP=1 frame-level AdaLN-LoRA 实验 |
+| `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR` | `$OMNI_CACHE_DIR/flash-attn-cute-dsl` | FA4 跨进程 persistent compile cache |
 
 默认 artifact 路径随实际 `NPROC` 和 launcher 类型变化：
 
@@ -408,6 +445,8 @@ entry，并保留 validation/checkpointer。不要复用 `fa3_profile_entry.py`�
 | `models/joint_causal_cosmos_model.py` | `split_cp_in_model` 防二次分片校验 |
 | `networks/causal_crossview_cosmos.py` | 明确拒绝尚未支持的 multiview 组合 |
 | `samples/post-training/optimized_block_causal_flash_attention.py` | sample-side CP=1 FA3 ragged-prefix custom autograd；不修改 release tree |
+| `samples/post-training/fa4_exact_block_causal_attention.py` | sample-side CP=1 fused exact FA4 backend；不修改 release tree |
+| `samples/post-training/optimized_repeated_adaln.py` | sample-side CP=1 frame-level AdaLN-LoRA；保持 checkpoint keys |
 
 ## 6. Nsight Systems profiling
 

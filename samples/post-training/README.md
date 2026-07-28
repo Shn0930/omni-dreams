@@ -219,6 +219,86 @@ implementation calls a private FA3 backward ABI; revalidate correctness and
 performance before changing that dependency. CP layout comparisons explicitly
 disable this switch.
 
+Two additional CP=1 experiments address the remaining attention and AdaLN
+costs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
+  OMNI_FA4_OVERLAY=/path/to/fa4-overlay \
+  OMNI_FA4_ACCEPT_UNSUPPORTED_PROTOBUF7=1 \
+  OMNI_FA4_EXACT_BLOCK_CAUSAL=1 \
+  OMNI_OPTIMIZE_REPEATED_ADALN=1 \
+  bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
+```
+
+`OMNI_FA4_EXACT_BLOCK_CAUSAL=1` replaces the 12 ragged-prefix FA3 calls in
+each layer with one exact FA4 CuTeDSL block-sparse forward/backward pair. It
+requires full logical blocks, a `tokens_per_block` multiple of 128, Hopper
+SM90, `CP_SIZE=1`, and the commit-pinned FA4 package below. It is mutually
+exclusive with `OMNI_FA3_CUSTOM_PREFIX_GRAD=1` because both replace the same
+CP=1 network binding.
+
+`OMNI_OPTIMIZE_REPEATED_ADALN=1` evaluates each pointwise AdaLN-LoRA MLP once
+per latent frame before spatial expansion. It is mathematically equivalent,
+keeps checkpoint parameter names unchanged, and currently requires
+`CP_SIZE=1` with complete frame-aligned chunks. BF16 gradient reductions can
+differ slightly because the GEMM reduction order changes.
+
+FA4 is a research-only profiling overlay, not a supported dependency of the
+post-training environment. `nvidia-cutlass-dsl-libs-base==4.6.0.dev0`
+declares `protobuf<7`, while OmniDreams deliberately requires
+`protobuf>=7.35,<8`. There is no resolver-valid combination for these pinned
+versions. The measured stack retained protobuf 7.35.1 and passed the Hopper
+forward/gradient tests, but that metadata override is unsupported upstream.
+
+Do not downgrade protobuf and do not install these packages into
+`OMNI_FA3_VENV`, `post-training/.venv`, or another shared environment. Build
+the pinned FA4 wheel, install the research packages into a separate `--target`
+overlay with `--no-deps`, and opt in explicitly:
+
+```bash
+git clone https://github.com/Dao-AILab/flash-attention.git \
+  /path/to/flash-attention
+git -C /path/to/flash-attention checkout \
+  14c377950125c70b7a9dabf9c561fca53715ac7d
+uv build --wheel --out-dir /path/to/fa4-dist \
+  /path/to/flash-attention/flash_attn/cute
+# Validated wheel SHA256:
+# aca91bc290ca656fa740005350c197342946396c0b04138eab95ddeb7be4d0bb
+
+# The Cosmos reference image may still contain protobuf 6.33.x. Restore the
+# repository security floor before adding the isolated overlay.
+uv pip install --python "$OMNI_FA3_VENV/bin/python" \
+  --no-deps protobuf==7.35.1
+
+export OMNI_FA4_OVERLAY=/path/to/fa4-overlay
+uv pip install --target "$OMNI_FA4_OVERLAY" \
+  --python "$OMNI_FA3_VENV/bin/python" \
+  --prerelease=allow --no-deps \
+  cuda-python==12.9.4 cuda-bindings==12.9.4 \
+  cuda-pathfinder==1.4.0 \
+  nvidia-cutlass-dsl-libs-base==4.6.0.dev0 \
+  nvidia-cutlass-dsl==4.6.0.dev0 \
+  apache-tvm-ffi==0.1.13rc2 torch-c-dlpack-ext==0.1.5 \
+  quack-kernels==0.5.3 \
+  /path/to/fa4-dist/flash_attn_4-0.0.1.dev1+g14c377950-py3-none-any.whl
+
+export OMNI_FA4_ACCEPT_UNSUPPORTED_PROTOBUF7=1
+```
+
+The base FA3 environment supplies protobuf 7.35.x, NumPy,
+`typing-extensions`, PyTorch, and Einops. `fa4_env.sh` rejects packages that
+resolve from the base venv, checks protobuf remains on the repository-approved
+7.35+ line, validates the exact FA4/CuTeDSL versions, and enables the
+persistent compile cache. Override
+`FLASH_ATTENTION_CUTE_DSL_CACHE_DIR` when multiple jobs should share a warmed,
+writable cache. Verify after installation that Torch remains
+`2.10.0+cu128`, FA2 remains `2.7.4.post1+cu128.torch210`, and FA3-NV remains
+`1.0.3+cu128.torch210`. A production integration remains blocked until an
+upstream-supported CUTLASS DSL/protobuf 7 combination passes the same strict
+correctness and end-to-end validation.
+
 `flash-attn-3-nv` is a BSD-3-Clause dependency supplied by the pinned Cosmos
 Framework lock. A run with `CP_SIZE=1` keeps context parallelism disabled;
 larger CP groups use the distributed single-view FA3 path.
@@ -305,6 +385,12 @@ Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.
 - `optimized_block_causal_flash_attention.py` — optional CP=1 FA3 autograd
   that accumulates ragged prefix gradients directly, avoiding generic
   full-sequence slice-gradient materialization.
+- `fa4_exact_block_causal_attention.py` — optional CP=1 fused exact
+  block-causal FA4 CuTeDSL backend.
+- `optimized_repeated_adaln.py` — optional CP=1 frame-level AdaLN-LoRA
+  computation with unchanged checkpoint keys.
+- `fa4_env.sh` — commit-pinned FA4/CuTeDSL environment and persistent-cache
+  validation.
 - `run_cp_attention_ab.sh` — configurable single-node Contiguous / Zigzag /
   Ulysses context-parallel correctness and performance launcher.
 - `run_fa3_cp1_ab.sh` and `run_cp4_attention_ab.sh` — compatibility wrappers

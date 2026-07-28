@@ -125,8 +125,22 @@ export OMNI_PROFILE_FIRST="$PROFILE_FIRST"
 export OMNI_PROFILE_LAST="$PROFILE_LAST"
 export OMNI_PROFILE_CAPTURE="$NSYS"
 export OMNI_FA3_CUSTOM_PREFIX_GRAD="${OMNI_FA3_CUSTOM_PREFIX_GRAD:-0}"
+export OMNI_FA4_EXACT_BLOCK_CAUSAL="${OMNI_FA4_EXACT_BLOCK_CAUSAL:-0}"
+export OMNI_OPTIMIZE_REPEATED_ADALN="${OMNI_OPTIMIZE_REPEATED_ADALN:-0}"
 if [[ "$OMNI_FA3_CUSTOM_PREFIX_GRAD" != "0" && "$OMNI_FA3_CUSTOM_PREFIX_GRAD" != "1" ]]; then
   echo "ERROR: OMNI_FA3_CUSTOM_PREFIX_GRAD must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$OMNI_OPTIMIZE_REPEATED_ADALN" != "0" && "$OMNI_OPTIMIZE_REPEATED_ADALN" != "1" ]]; then
+  echo "ERROR: OMNI_OPTIMIZE_REPEATED_ADALN must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$OMNI_FA4_EXACT_BLOCK_CAUSAL" != "0" && "$OMNI_FA4_EXACT_BLOCK_CAUSAL" != "1" ]]; then
+  echo "ERROR: OMNI_FA4_EXACT_BLOCK_CAUSAL must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$OMNI_FA3_CUSTOM_PREFIX_GRAD" == "1" && "$OMNI_FA4_EXACT_BLOCK_CAUSAL" == "1" ]]; then
+  echo "ERROR: OMNI_FA3_CUSTOM_PREFIX_GRAD and OMNI_FA4_EXACT_BLOCK_CAUSAL are mutually exclusive." >&2
   exit 2
 fi
 if [[ "$OMNI_FA3_CUSTOM_PREFIX_GRAD" == "1" ]]; then
@@ -139,11 +153,29 @@ if [[ "$OMNI_FA3_CUSTOM_PREFIX_GRAD" == "1" ]]; then
     exit 2
   fi
 fi
+if [[ "$OMNI_FA4_EXACT_BLOCK_CAUSAL" == "1" ]]; then
+  if [[ "$ATTENTION_BACKEND" != "flash_attn_3" ]]; then
+    echo "ERROR: OMNI_FA4_EXACT_BLOCK_CAUSAL=1 requires mode fa3 or fa3-sac." >&2
+    exit 2
+  fi
+  if (( CP_SIZE != 1 )); then
+    echo "ERROR: OMNI_FA4_EXACT_BLOCK_CAUSAL=1 currently supports CP_SIZE=1 only." >&2
+    exit 2
+  fi
+fi
+if [[ "$OMNI_OPTIMIZE_REPEATED_ADALN" == "1" && "$CP_SIZE" != "1" ]]; then
+  echo "ERROR: OMNI_OPTIMIZE_REPEATED_ADALN=1 currently supports CP_SIZE=1 only." >&2
+  exit 2
+fi
 
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/_env.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/fa3_env.sh"
+if [[ "$OMNI_FA4_EXACT_BLOCK_CAUSAL" == "1" ]]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/fa4_env.sh"
+fi
 
 WRAPPER="$SCRIPT_DIR/triton_per_rank_wrap.sh"
 ENTRY="$SCRIPT_DIR/fa3_profile_entry.py"
@@ -176,6 +208,15 @@ fi
   echo "profile_last=$PROFILE_LAST"
   echo "custom_prefix_grad_requested=$OMNI_FA3_CUSTOM_PREFIX_GRAD"
   echo "custom_prefix_grad_effective=$OMNI_FA3_CUSTOM_PREFIX_GRAD"
+  echo "fa4_exact_block_causal_requested=$OMNI_FA4_EXACT_BLOCK_CAUSAL"
+  echo "fa4_exact_block_causal_effective=$OMNI_FA4_EXACT_BLOCK_CAUSAL"
+  if [[ "$OMNI_FA4_EXACT_BLOCK_CAUSAL" == "1" ]]; then
+    echo "fa4_overlay=$OMNI_FA4_OVERLAY"
+    echo "fa4_accept_unsupported_protobuf7=$OMNI_FA4_ACCEPT_UNSUPPORTED_PROTOBUF7"
+    echo "fa4_protobuf_version=$("$OMNI_FA3_PYTHON" -c 'from google.protobuf import __version__; print(__version__)')"
+  fi
+  echo "repeated_adaln_requested=$OMNI_OPTIMIZE_REPEATED_ADALN"
+  echo "repeated_adaln_effective=$OMNI_OPTIMIZE_REPEATED_ADALN"
   echo "cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
   echo "profile_data_root=$PROFILE_DATA_ROOT"
   find "$PROFILE_DATA_ROOT" -type l -printf 'dataset_link=%p -> %l\n' | sort
@@ -200,7 +241,7 @@ fi
     "$NSYS_BIN" --version | head -1
   fi
   "$PYTHON" - <<'PY'
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
@@ -210,14 +251,21 @@ print(f"torch_cuda={torch.version.cuda}")
 print(f"transformer_engine={version('transformer-engine')}")
 print(f"flash_attn={version('flash-attn')}")
 print(f"flash_attn_3_nv={version('flash-attn-3-nv')}")
+try:
+    print(f"flash_attn_4={version('flash-attn-4')}")
+except PackageNotFoundError:
+    print("flash_attn_4=unavailable")
 print(f"natten={version('natten')}")
 PY
   nvidia-smi -i "$CUDA_VISIBLE_DEVICES" \
     --query-gpu=index,uuid,name,driver_version --format=csv,noheader
   sha256sum \
     "$SCRIPT_DIR/fa3_env.sh" \
+    "$SCRIPT_DIR/fa4_env.sh" \
     "$SCRIPT_DIR/fa3_profile_entry.py" \
+    "$SCRIPT_DIR/fa4_exact_block_causal_attention.py" \
     "$SCRIPT_DIR/optimized_block_causal_flash_attention.py" \
+    "$SCRIPT_DIR/optimized_repeated_adaln.py" \
     "$SCRIPT_DIR/run_fa3_attention_ab.sh" \
     "$REPO_ROOT/post-training/omnidreams/_src/imaginaire/utils/context_parallel.py" \
     "$REPO_ROOT/post-training/omnidreams/_src/omnidreams/modules/block_causal_flash_attention.py" \
@@ -234,7 +282,10 @@ fi
 mkdir -p "$ARTIFACT_DIR/source-snapshot"
 for source_file in \
   fa3_profile_entry.py \
+  fa4_env.sh \
+  fa4_exact_block_causal_attention.py \
   optimized_block_causal_flash_attention.py \
+  optimized_repeated_adaln.py \
   run_fa3_attention_ab.sh; do
   cp -a "$SCRIPT_DIR/$source_file" "$ARTIFACT_DIR/source-snapshot/$source_file"
 done

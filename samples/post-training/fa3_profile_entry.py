@@ -19,6 +19,19 @@ if CUSTOM_PREFIX_GRAD_VALUE not in {"0", "1"}:
         f"OMNI_FA3_CUSTOM_PREFIX_GRAD must be 0 or 1, got {CUSTOM_PREFIX_GRAD_VALUE!r}"
     )
 CUSTOM_PREFIX_GRAD = CUSTOM_PREFIX_GRAD_VALUE == "1"
+FA4_EXACT_VALUE = os.environ.get("OMNI_FA4_EXACT_BLOCK_CAUSAL", "0")
+if FA4_EXACT_VALUE not in {"0", "1"}:
+    raise ValueError(f"OMNI_FA4_EXACT_BLOCK_CAUSAL must be 0 or 1, got {FA4_EXACT_VALUE!r}")
+FA4_EXACT = FA4_EXACT_VALUE == "1"
+REPEATED_ADALN_VALUE = os.environ.get("OMNI_OPTIMIZE_REPEATED_ADALN", "0")
+if REPEATED_ADALN_VALUE not in {"0", "1"}:
+    raise ValueError(f"OMNI_OPTIMIZE_REPEATED_ADALN must be 0 or 1, got {REPEATED_ADALN_VALUE!r}")
+REPEATED_ADALN = REPEATED_ADALN_VALUE == "1"
+if CUSTOM_PREFIX_GRAD and FA4_EXACT:
+    raise ValueError(
+        "OMNI_FA3_CUSTOM_PREFIX_GRAD and OMNI_FA4_EXACT_BLOCK_CAUSAL "
+        "replace the same CP=1 attention binding and are mutually exclusive"
+    )
 _original_after_backward = NVTXCallback.on_after_backward
 
 if CUSTOM_PREFIX_GRAD:
@@ -27,6 +40,18 @@ if CUSTOM_PREFIX_GRAD:
     )
 
     install_optimized_block_causal_flash_attention()
+
+if FA4_EXACT:
+    from fa4_exact_block_causal_attention import (
+        install_fa4_exact_block_causal_attention,
+    )
+
+    install_fa4_exact_block_causal_attention()
+
+if REPEATED_ADALN:
+    from optimized_repeated_adaln import install_repeated_adaln_optimization
+
+    install_repeated_adaln_optimization()
 
 
 def _range_call(name, function, *args, **kwargs):
