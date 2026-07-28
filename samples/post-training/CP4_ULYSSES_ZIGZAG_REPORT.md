@@ -2,6 +2,9 @@
 
 日期：2026-07-28
 
+运行和配置说明见
+[CP=4 Zigzag / Ulysses 使用指南](./CP4_CONTEXT_PARALLEL_USAGE.md)。
+
 ## 结论
 
 本分支在单视角 causal training 路径中实现了两种 CP=4 负载均衡策略：
@@ -274,7 +277,7 @@ bash samples/post-training/run_cp4_attention_ab.sh fa3-ulysses
 四卡数值 oracle：
 
 ```bash
-export OMNI_CACHE_DIR=/raid/john/.cache  # 或包含 FA3 venv 的其他 cache root
+export OMNI_CACHE_DIR=/path/to/cache
 source samples/post-training/_env.sh
 source samples/post-training/fa3_env.sh
 cd post-training
@@ -285,8 +288,8 @@ CUDA_VISIBLE_DEVICES=1,2,3,4 \
 
 主要 artifacts：
 
-- A/B：`/raid/john/.cache/nsys/omnidreams_df93_4gpu/cp4_attention/df93_cp4_fa3_*_ab*_20260728_*`
-- Clean nsys：`/raid/john/.cache/nsys/omnidreams_df93_4gpu/cp4_attention/df93_cp4_fa3_*_nsys_opt_20260728_02`
-- nsys 汇总：`/raid/john/.cache/nsys/omnidreams_df93_4gpu/cp4_attention/cp4_fa3_opt_nsys_comparison_20260728_02.analysis.md`
+- A/B：`$OMNI_CACHE_DIR/nsys/omnidreams_df93_4gpu/cp4_attention/df93_cp4_fa3_*_ab*_20260728_*`
+- Clean nsys：`$OMNI_CACHE_DIR/nsys/omnidreams_df93_4gpu/cp4_attention/df93_cp4_fa3_*_nsys_opt_20260728_02`
+- nsys 汇总：`$OMNI_CACHE_DIR/nsys/omnidreams_df93_4gpu/cp4_attention/cp4_fa3_opt_nsys_comparison_20260728_02.analysis.md`
 
 注意：nsys kernel lifetime 可包含 collective wait 且不同 stream 会 overlap，不能把所有 kernel duration 直接相加为 wall time。本报告使用 synchronized full iteration、跨 stage 的 model-only window，以及 per-rank attention kernel balance 共同判断。

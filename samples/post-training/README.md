@@ -197,6 +197,11 @@ still fail fast.
 `run_cp4_attention_ab.sh` keeps CP=4/FSDP=4, FA3, SAC, data, and checkpoint
 fixed while changing only the training CP strategy:
 
+Start with the dedicated
+[CP=4 Zigzag / Ulysses usage guide](./CP4_CONTEXT_PARALLEL_USAGE.md) for the
+supported scope, FA3 environment, strategy selection, launcher options,
+correctness tests, and troubleshooting.
+
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
   bash samples/post-training/run_cp4_attention_ab.sh fa3-contiguous
@@ -210,9 +215,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 NSYS=1 \
   bash samples/post-training/run_cp4_attention_ab.sh fa3-ulysses
 ```
 
-This workflow currently supports non-interleaved, single-view causal training
-on four Hopper GPUs and requires `split_cp_in_model=false`. Ulysses also
-requires `num_heads % cp_size == 0`. See the
+This validated experimental profiling workflow covers non-interleaved,
+single-view causal training, requires SM90, and was measured on four H20-3e
+GPUs. It also requires `split_cp_in_model=false`. The launcher disables
+validation and checkpoint writes, so it must not be used as a production
+training launcher. Ulysses additionally requires `num_heads % cp_size == 0`.
+See the
 [implementation and performance report](./CP4_ULYSSES_ZIGZAG_REPORT.md) for
 the layout, correctness checks, benchmark method, and measured results.
 
@@ -247,6 +255,9 @@ Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.
   `_${LOCAL_RANK}` to `TRITON_CACHE_BASE` so 8 ranks never share a hash dir.
 - `run_cp4_attention_ab.sh` — four-GPU CP=4 launcher for FA3 Contiguous,
   Zigzag, and Ulysses correctness/performance profiling.
+- `CP4_CONTEXT_PARALLEL_USAGE.md` — user-facing setup, configuration,
+  launch, validation, profiling, and troubleshooting guide for CP=4 Zigzag
+  and Ulysses.
 - `CP4_ULYSSES_ZIGZAG_REPORT.md` — implementation, two-run A/B, memory, and
   all-rank nsys findings for the CP=4 strategies.
 - `prepare.py` — `snapshot_download`s the HF sample dataset and symlinks its
