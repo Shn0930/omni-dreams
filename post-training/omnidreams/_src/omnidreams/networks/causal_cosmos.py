@@ -33,6 +33,8 @@ from transformer_engine.pytorch.attention import DotProductAttention
 
 from omnidreams._src.imaginaire.utils import log
 from omnidreams._src.imaginaire.utils.context_parallel import cat_outputs_cp, cat_outputs_cp_with_grad
+from omnidreams._src.omnidreams.modules.block_causal_flash_attention import block_causal_flash_attention
+from omnidreams._src.omnidreams.modules.flex_attention import flex_attention_cp
 from omnidreams._src.predict2.conditioner import DataType
 from omnidreams._src.predict2.networks.minimal_v4_dit import (
     Attention,
@@ -48,7 +50,6 @@ from omnidreams._src.predict2.networks.minimal_v4_dit import (
     VideoRopePosition3DEmb,
 )
 from omnidreams._src.predict2.networks.model_weights_stats import WeightTrainingStat
-from omnidreams._src.omnidreams.modules.flex_attention import flex_attention_cp
 
 # Compile flex_attention for better performance
 flex_attention = torch.compile(flex_attention, dynamic=False)
@@ -91,6 +92,7 @@ class CausalSelfAttention(nn.Module):
         use_wan_fp32_strategy: bool = False,
         local_attn_size: int = -1,
         sink_size: int = 0,
+        training_attention_backend: str = "flex",
     ):
         super().__init__()
         log.debug(
@@ -113,6 +115,12 @@ class CausalSelfAttention(nn.Module):
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
+        if training_attention_backend not in {"flex", "flash_attn_3"}:
+            raise ValueError(
+                f"Invalid training_attention_backend={training_attention_backend!r}; expected 'flex' or 'flash_attn_3'"
+            )
+        self.training_attention_backend = training_attention_backend
+        self.num_frame_per_block = 1
 
         # QKV projections (matching Attention class)
         self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
@@ -219,38 +227,60 @@ class CausalSelfAttention(nn.Module):
         v = self.v_proj(x).view(b, s, n, d)
 
         if kv_cache is None:
-            # Training mode: use flex_attention with block mask
+            # Training mode: use FlexAttention or the CP=1 FlashAttention-3
+            # block-prefix decomposition.
             roped_q, roped_k = self._apply_rope(q, k, rope_emb)
             roped_q = roped_q.type_as(v)
             roped_k = roped_k.type_as(v)
 
-            # Pad to multiple of 128 for flex_attention
-            padded_length = math.ceil(s / 128) * 128 - s
-
-            if padded_length > 0:
-                pad_shape = [b, padded_length, n, d]
-                roped_q = torch.cat([roped_q, torch.zeros(pad_shape, device=q.device, dtype=v.dtype)], dim=1)
-                roped_k = torch.cat([roped_k, torch.zeros(pad_shape, device=k.device, dtype=v.dtype)], dim=1)
-                v_padded = torch.cat([v, torch.zeros(pad_shape, device=v.device, dtype=v.dtype)], dim=1)
+            if self.training_attention_backend == "flash_attn_3":
+                cp_size = 1 if self.cp_group is None else self.cp_group.size()
+                if cp_size != 1:
+                    raise NotImplementedError(
+                        "The FlashAttention-3 block-causal training backend currently supports CP=1 only"
+                    )
+                if video_size is None:
+                    raise ValueError("video_size is required by the FlashAttention-3 block-causal backend")
+                expected_sequence_length = video_size.T * video_size.H * video_size.W
+                if s != expected_sequence_length:
+                    raise ValueError(
+                        "The FlashAttention-3 block-causal backend expects an unsplit full sequence: "
+                        f"got {s} tokens, expected {expected_sequence_length} from video_size={video_size}"
+                    )
+                tokens_per_block = video_size.H * video_size.W * self.num_frame_per_block
+                out = block_causal_flash_attention(
+                    roped_q,
+                    roped_k,
+                    v,
+                    tokens_per_block=tokens_per_block,
+                )
             else:
-                v_padded = v
+                # Pad each CP rank's sequence to a multiple of 128 for FlexAttention.
+                padded_length = math.ceil(s / 128) * 128 - s
 
-            # Apply flex_attention with context parallel support
-            # flex_attention expects [B, H, S, D] format
-            out = flex_attention_cp(
-                query=roped_q.transpose(2, 1),
-                key=roped_k.transpose(2, 1),
-                value=v_padded.transpose(2, 1),
-                block_mask=block_mask,
-                process_group=self.cp_group,
-                flex_attention_fn=flex_attention,
-            )
+                if padded_length > 0:
+                    pad_shape = [b, padded_length, n, d]
+                    roped_q = torch.cat([roped_q, torch.zeros(pad_shape, device=q.device, dtype=v.dtype)], dim=1)
+                    roped_k = torch.cat([roped_k, torch.zeros(pad_shape, device=k.device, dtype=v.dtype)], dim=1)
+                    v_padded = torch.cat([v, torch.zeros(pad_shape, device=v.device, dtype=v.dtype)], dim=1)
+                else:
+                    v_padded = v
 
-            # Remove padding and transpose back
-            if padded_length > 0:
-                out = out[:, :, :-padded_length].transpose(2, 1)
-            else:
-                out = out.transpose(2, 1)
+                # flex_attention expects [B, H, S, D] format.
+                out = flex_attention_cp(
+                    query=roped_q.transpose(2, 1),
+                    key=roped_k.transpose(2, 1),
+                    value=v_padded.transpose(2, 1),
+                    block_mask=block_mask,
+                    process_group=self.cp_group,
+                    flex_attention_fn=flex_attention,
+                )
+
+                # Remove padding and transpose back.
+                if padded_length > 0:
+                    out = out[:, :, :-padded_length].transpose(2, 1)
+                else:
+                    out = out.transpose(2, 1)
 
         elif disable_kv_cache:
             # Inference without KV cache
@@ -382,6 +412,7 @@ class CausalCosmosBlock(nn.Module):
         # Causal-specific parameters
         local_attn_size: int = -1,
         sink_size: int = 0,
+        training_attention_backend: str = "flex",
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -399,6 +430,7 @@ class CausalCosmosBlock(nn.Module):
             use_wan_fp32_strategy=use_wan_fp32_strategy,
             local_attn_size=local_attn_size,
             sink_size=sink_size,
+            training_attention_backend=training_attention_backend,
         )
 
         # Cross-attention (using standard Attention from minimal_v4_dit)
@@ -635,6 +667,7 @@ class CosmosCausalDiT(WeightTrainingStat):
         postpone_checkpoint: bool = False,
         on_the_fly_checkpoint: bool = False,
         use_wan_fp32_strategy: bool = False,
+        training_attention_backend: str = "flex",
         **kwargs,
     ):
         super().__init__()
@@ -656,6 +689,7 @@ class CosmosCausalDiT(WeightTrainingStat):
         self.sink_size = sink_size
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
         self.on_the_fly_checkpoint = on_the_fly_checkpoint
+        self.training_attention_backend = training_attention_backend
 
         # Positional embedding settings
         self.pos_emb_cls = pos_emb_cls
@@ -709,6 +743,7 @@ class CosmosCausalDiT(WeightTrainingStat):
                     use_wan_fp32_strategy=use_wan_fp32_strategy,
                     local_attn_size=local_attn_size,
                     sink_size=sink_size,
+                    training_attention_backend=training_attention_backend,
                 )
                 for _ in range(num_blocks)
             ]
@@ -753,6 +788,22 @@ class CosmosCausalDiT(WeightTrainingStat):
         # Context parallel
         self.cp_group: ProcessGroup | None = None
         self._is_context_parallel_enabled = False
+
+    @property
+    def num_frame_per_block(self) -> int:
+        return self._num_frame_per_block
+
+    @num_frame_per_block.setter
+    def num_frame_per_block(self, value: int) -> None:
+        if value <= 0:
+            raise ValueError(f"num_frame_per_block must be positive, got {value}")
+        self._num_frame_per_block = value
+        # JointCausalCosmosModel sets this value after constructing the network.
+        # Keep every attention layer synchronized, including checkpoint-wrapped
+        # blocks (CheckpointWrapper forwards attribute access to its module).
+        if hasattr(self, "blocks"):
+            for block in self.blocks:
+                block.self_attn.num_frame_per_block = value
 
     def _build_patch_embed(self) -> None:
         in_ch = self.in_channels + 1 if self.concat_padding_mask else self.in_channels
@@ -824,8 +875,8 @@ class CosmosCausalDiT(WeightTrainingStat):
         Prepare block-wise causal attention mask for flex_attention.
 
         The token sequence is divided into blocks of num_frame_per_block frames.
-        Tokens can attend to all tokens in previous blocks and within their own block
-        up to and including their position (causal within block).
+        Tokens can attend to all tokens in previous blocks and every token in
+        their own block.
         """
         log.info(
             f"Constructing block mask: num_frames={num_frames}, frame_seqlen={frame_seqlen}, "
@@ -998,6 +1049,10 @@ class CosmosCausalDiT(WeightTrainingStat):
                 img_context_emb=img_context_emb,
             )
         else:
+            if self.training_attention_backend == "flash_attn_3" and num_interleave != 0:
+                raise NotImplementedError(
+                    "The FlashAttention-3 block-causal training backend does not support num_interleave > 0"
+                )
             return self._forward_train(
                 x_B_C_T_H_W=x_B_C_T_H_W,
                 timesteps_B_T=timesteps_B_T,
@@ -1033,18 +1088,33 @@ class CosmosCausalDiT(WeightTrainingStat):
 
         mask_key = f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}_cp{cp_size}"
 
-        if mask_key not in self.block_mask_dict:
-            block_mask = self._prepare_blockwise_causal_attn_mask(
-                device=device,
-                num_frames=num_frames // (num_interleave + 1),
-                frame_seqlen=frame_seqlen,
-                num_frame_per_block=self.num_frame_per_block,
-                num_interleave=num_interleave,
-                cp_size=cp_size,
-            )
-            self.block_mask_dict[mask_key] = block_mask
+        if self.training_attention_backend == "flash_attn_3":
+            if num_interleave != 0:
+                raise NotImplementedError(
+                    "The FlashAttention-3 block-causal training backend does not support num_interleave > 0"
+                )
+            if cp_size != 1:
+                raise NotImplementedError(
+                    "The FlashAttention-3 block-causal training backend currently supports CP=1 only"
+                )
+            if self.patch_temporal != 1:
+                raise NotImplementedError(
+                    "The FlashAttention-3 block-causal training backend currently requires patch_temporal=1"
+                )
+            block_mask = None
         else:
-            block_mask = self.block_mask_dict[mask_key]
+            if mask_key not in self.block_mask_dict:
+                block_mask = self._prepare_blockwise_causal_attn_mask(
+                    device=device,
+                    num_frames=num_frames // (num_interleave + 1),
+                    frame_seqlen=frame_seqlen,
+                    num_frame_per_block=self.num_frame_per_block,
+                    num_interleave=num_interleave,
+                    cp_size=cp_size,
+                )
+                self.block_mask_dict[mask_key] = block_mask
+            else:
+                block_mask = self.block_mask_dict[mask_key]
 
         # Prepare inputs
         if self.concat_padding_mask and padding_mask is not None:

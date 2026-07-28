@@ -137,6 +137,59 @@ commented placeholders for `--account` and `--partition`. Either pass them
 on the `sbatch` command line, or uncomment and edit the `##SBATCH` lines at
 the top of the file.
 
+### Optional CP=1 FlashAttention-3 profiling
+
+`run_fa3_cp1_ab.sh` compares the existing FlexAttention path, the CP=1
+block-causal FlashAttention-3 path, and FlashAttention-3 with the existing
+aggressive selective-activation-checkpoint policy. This is a four-GPU
+profiling workflow, separate from the supported 8-GPU smoke experiments
+above.
+
+The FA3 path currently requires four x86_64 Hopper (SM90) GPUs, CP=1/FSDP=4,
+`patch_temporal=1`, and a non-interleaved single-view model. Its validated
+software stack is Python 3.13, PyTorch 2.10, CUDA 12.8, Transformer Engine
+2.12, and `flash-attn-3-nv` 1.0.3. Create that environment from the pinned
+[NVIDIA Cosmos Framework](https://github.com/NVIDIA/cosmos-framework)
+revision:
+
+```bash
+git clone https://github.com/NVIDIA/cosmos-framework.git /path/to/cosmos-framework
+git -C /path/to/cosmos-framework checkout \
+  117c7d21f04b374a57a81a6e6a50416718b4e191
+
+export OMNI_FA3_VENV=/path/to/cosmos-cu128-torch210-venv
+UV_PROJECT_ENVIRONMENT="$OMNI_FA3_VENV" \
+  uv sync --project /path/to/cosmos-framework --locked \
+    --no-default-groups --group=cu128-train --python 3.13
+
+uv pip install --python "$OMNI_FA3_VENV/bin/python" \
+  -e post-training/packages/cosmos-cuda \
+  -e post-training/packages/cosmos-oss \
+  -e post-training \
+  pytz==2026.2 decord==0.6.0
+```
+
+Run `setup_env.sh` first to stage the standard 93-frame sample dataset, or
+set `PROFILE_DATA_ROOT` to another dataset with the layout documented below.
+The three modes keep the dataset and FSDP configuration fixed:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  bash samples/post-training/run_fa3_cp1_ab.sh flex
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  bash samples/post-training/run_fa3_cp1_ab.sh fa3
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  bash samples/post-training/run_fa3_cp1_ab.sh fa3-sac
+
+# Add an Nsight Systems capture when nsys is on PATH.
+CUDA_VISIBLE_DEVICES=0,1,2,3 NSYS=1 \
+  bash samples/post-training/run_fa3_cp1_ab.sh fa3-sac
+```
+
+`flash-attn-3-nv` is a BSD-3-Clause dependency supplied by the pinned Cosmos
+Framework lock. The implementation fails fast for CP>1, interleaved layouts,
+cross-view models, non-SM90 GPUs, or unsupported dtypes.
+
 ## Required env on compute nodes
 
 Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.

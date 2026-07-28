@@ -15,13 +15,13 @@ from torchvision import transforms
 
 from omnidreams._src.imaginaire.utils import distributed
 from omnidreams._src.imaginaire.utils.context_parallel import cat_outputs_cp, cat_outputs_cp_with_grad
-from omnidreams._src.predict2.conditioner import DataType
-from omnidreams._src.predict2.networks.minimal_v4_dit import PatchEmbed
 from omnidreams._src.omnidreams.networks.causal_cosmos import (
     DEBUG,
     CosmosCausalDiT,
     VideoSize,
 )
+from omnidreams._src.predict2.conditioner import DataType
+from omnidreams._src.predict2.networks.minimal_v4_dit import PatchEmbed
 
 
 class CosmosCausalHdmapDiT(CosmosCausalDiT):
@@ -141,6 +141,10 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
                 control_input_hdmap_bbox=control_input_hdmap_bbox,
             )
         else:
+            if self.training_attention_backend == "flash_attn_3" and num_interleave != 0:
+                raise NotImplementedError(
+                    "The FlashAttention-3 block-causal training backend does not support num_interleave > 0"
+                )
             return self._forward_train(
                 x_B_C_T_H_W=x_B_C_T_H_W,
                 timesteps_B_T=timesteps_B_T,
@@ -178,18 +182,33 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
 
         mask_key = f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}_cp{cp_size}"
 
-        if mask_key not in self.block_mask_dict:
-            block_mask = self._prepare_blockwise_causal_attn_mask(
-                device=device,
-                num_frames=num_frames // (num_interleave + 1),
-                frame_seqlen=frame_seqlen,
-                num_frame_per_block=self.num_frame_per_block,
-                num_interleave=num_interleave,
-                cp_size=cp_size,
-            )
-            self.block_mask_dict[mask_key] = block_mask
+        if self.training_attention_backend == "flash_attn_3":
+            if num_interleave != 0:
+                raise NotImplementedError(
+                    "The FlashAttention-3 block-causal training backend does not support num_interleave > 0"
+                )
+            if cp_size != 1:
+                raise NotImplementedError(
+                    "The FlashAttention-3 block-causal training backend currently supports CP=1 only"
+                )
+            if self.patch_temporal != 1:
+                raise NotImplementedError(
+                    "The FlashAttention-3 block-causal training backend currently requires patch_temporal=1"
+                )
+            block_mask = None
         else:
-            block_mask = self.block_mask_dict[mask_key]
+            if mask_key not in self.block_mask_dict:
+                block_mask = self._prepare_blockwise_causal_attn_mask(
+                    device=device,
+                    num_frames=num_frames // (num_interleave + 1),
+                    frame_seqlen=frame_seqlen,
+                    num_frame_per_block=self.num_frame_per_block,
+                    num_interleave=num_interleave,
+                    cp_size=cp_size,
+                )
+                self.block_mask_dict[mask_key] = block_mask
+            else:
+                block_mask = self.block_mask_dict[mask_key]
 
         # Prepare inputs
         if self.concat_padding_mask and padding_mask is not None:
