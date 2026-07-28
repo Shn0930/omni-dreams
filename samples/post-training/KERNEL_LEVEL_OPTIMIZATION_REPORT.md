@@ -962,7 +962,10 @@ launch 都不是主要方向。
    FC2-selective SAC 已实测回收约 `0.56 s`、增加 `8.379 GiB` peak，
    详见 §15；FC1+FC2 需要约 `45.1 GiB` raw retention 才多回收约
    `0.564 s`，性价比不足，当前拒绝。剩余 `4.085 s` true backward
-   只能通过 FP8/fused MLP、packed projection 或模型结构变化处理。
+   包含 MLP dX/dW 与 self/cross projection 的多种 shape/layout；
+   FP8/fused MLP、packed projection 或结构性共享是当前最高置信方向，
+   但在排除所有 BF16 kernel/layout 调优前，仍需分别补抓 dominant
+   `NTT/NTN/NNN` true-backward signature 的 exact-layout NCU。
 3. **消除 AdaLN repeat materialization。** 让 scale/shift/gate consumer
    接受 frame-strided broadcast，或融合到 norm/gated residual；当前
    signature 上限先按约 `0.23 s/iter`。
@@ -1090,7 +1093,8 @@ path 缩短而自然缩短；它依旧不是独立 idle hole。
 ### 15.4 Exact-layout NVJET NCU
 
 使用提供的 CUDA 12.8 镜像、GPU 7 和 `--cap-add SYS_ADMIN`，按最新
-`gpu-kernel-profiling` full metric list 捕获 production FC2 TNN。宿主机
+`gpu-kernel-profiling` 的 `capture-ncu.sh --tier full` 显式 33-metric
+列表捕获 production FC2 TNN；这不是 NCU 内建的 `--set full`。宿主机
 直接 NCU 会因 `RmProfilingAdminOnly=1` 返回
 `ERR_NVGPUCTRPERM`；容器采集未修改宿主配置。
 
@@ -1104,12 +1108,14 @@ path 缩短而自然缩短；它依旧不是独立 idle hole。
 | Barrier | 27.72% |
 | Long scoreboard | 16.38% |
 
-该 exact-layout 结果确认 BF16 NVJET 的局部 kernel 已接近 compute
+该 exact-layout 结果确认 FC2 forward/replay NVJET 的局部 kernel 已接近 compute
 ceiling。低 occupancy 是 warp-specialized persistent GEMM 的资源布局，
 在 Math SOL `98.84%` 时不能单独当成优化目标。下一步若继续处理剩余
 `4.085 s` true backward，应优先评估降低计算量的 FP8/TE fused MLP、
-packed projections 或结构性共享；只换同 FLOP BF16 GEMM tile 的预期收益
-很小。
+packed projections 或结构性共享。这个 profile 只覆盖 FC2 TNN，
+不能代替 MLP dX/dW 和 self/cross projection 的 `NTT/NTN/NNN`
+exact-layout NCU；补齐这些 signature 前，不应笼统排除所有 BF16
+kernel/layout 调优。
 
 ### 15.5 Artifacts 与回归
 
