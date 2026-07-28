@@ -127,6 +127,7 @@ export OMNI_PROFILE_CAPTURE="$NSYS"
 export OMNI_FA3_CUSTOM_PREFIX_GRAD="${OMNI_FA3_CUSTOM_PREFIX_GRAD:-0}"
 export OMNI_FA4_EXACT_BLOCK_CAUSAL="${OMNI_FA4_EXACT_BLOCK_CAUSAL:-0}"
 export OMNI_OPTIMIZE_REPEATED_ADALN="${OMNI_OPTIMIZE_REPEATED_ADALN:-0}"
+export OMNI_SAC_SAVE_MLP_FC2="${OMNI_SAC_SAVE_MLP_FC2:-0}"
 if [[ "$OMNI_FA3_CUSTOM_PREFIX_GRAD" != "0" && "$OMNI_FA3_CUSTOM_PREFIX_GRAD" != "1" ]]; then
   echo "ERROR: OMNI_FA3_CUSTOM_PREFIX_GRAD must be 0 or 1." >&2
   exit 2
@@ -134,6 +135,22 @@ fi
 if [[ "$OMNI_OPTIMIZE_REPEATED_ADALN" != "0" && "$OMNI_OPTIMIZE_REPEATED_ADALN" != "1" ]]; then
   echo "ERROR: OMNI_OPTIMIZE_REPEATED_ADALN must be 0 or 1." >&2
   exit 2
+fi
+if [[ "$OMNI_SAC_SAVE_MLP_FC2" != "0" && "$OMNI_SAC_SAVE_MLP_FC2" != "1" ]]; then
+  echo "ERROR: OMNI_SAC_SAVE_MLP_FC2 must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$OMNI_SAC_SAVE_MLP_FC2" == "1" && "$MODE" != "fa3-sac" ]]; then
+  echo "ERROR: OMNI_SAC_SAVE_MLP_FC2=1 requires mode fa3-sac." >&2
+  exit 2
+fi
+if [[ "$OMNI_SAC_SAVE_MLP_FC2" == "1" ]]; then
+  for extra_arg in "${EXTRA_ARGS[@]}"; do
+    if [[ "$extra_arg" == *"sac_config.mode"* ]]; then
+      echo "ERROR: do not override sac_config.mode when OMNI_SAC_SAVE_MLP_FC2=1." >&2
+      exit 2
+    fi
+  done
 fi
 if [[ "$OMNI_FA4_EXACT_BLOCK_CAUSAL" != "0" && "$OMNI_FA4_EXACT_BLOCK_CAUSAL" != "1" ]]; then
   echo "ERROR: OMNI_FA4_EXACT_BLOCK_CAUSAL must be 0 or 1." >&2
@@ -217,6 +234,8 @@ fi
   fi
   echo "repeated_adaln_requested=$OMNI_OPTIMIZE_REPEATED_ADALN"
   echo "repeated_adaln_effective=$OMNI_OPTIMIZE_REPEATED_ADALN"
+  echo "sac_save_mlp_fc2_requested=$OMNI_SAC_SAVE_MLP_FC2"
+  echo "sac_save_mlp_fc2_effective=$OMNI_SAC_SAVE_MLP_FC2"
   echo "cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
   echo "profile_data_root=$PROFILE_DATA_ROOT"
   find "$PROFILE_DATA_ROOT" -type l -printf 'dataset_link=%p -> %l\n' | sort
@@ -266,6 +285,7 @@ PY
     "$SCRIPT_DIR/fa4_exact_block_causal_attention.py" \
     "$SCRIPT_DIR/optimized_block_causal_flash_attention.py" \
     "$SCRIPT_DIR/optimized_repeated_adaln.py" \
+    "$SCRIPT_DIR/optimized_selective_checkpoint.py" \
     "$SCRIPT_DIR/run_fa3_attention_ab.sh" \
     "$REPO_ROOT/post-training/omnidreams/_src/imaginaire/utils/context_parallel.py" \
     "$REPO_ROOT/post-training/omnidreams/_src/omnidreams/modules/block_causal_flash_attention.py" \
@@ -286,6 +306,7 @@ for source_file in \
   fa4_exact_block_causal_attention.py \
   optimized_block_causal_flash_attention.py \
   optimized_repeated_adaln.py \
+  optimized_selective_checkpoint.py \
   run_fa3_attention_ab.sh; do
   cp -a "$SCRIPT_DIR/$source_file" "$ARTIFACT_DIR/source-snapshot/$source_file"
 done

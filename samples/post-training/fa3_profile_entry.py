@@ -27,6 +27,10 @@ REPEATED_ADALN_VALUE = os.environ.get("OMNI_OPTIMIZE_REPEATED_ADALN", "0")
 if REPEATED_ADALN_VALUE not in {"0", "1"}:
     raise ValueError(f"OMNI_OPTIMIZE_REPEATED_ADALN must be 0 or 1, got {REPEATED_ADALN_VALUE!r}")
 REPEATED_ADALN = REPEATED_ADALN_VALUE == "1"
+SAVE_MLP_FC2_VALUE = os.environ.get("OMNI_SAC_SAVE_MLP_FC2", "0")
+if SAVE_MLP_FC2_VALUE not in {"0", "1"}:
+    raise ValueError(f"OMNI_SAC_SAVE_MLP_FC2 must be 0 or 1, got {SAVE_MLP_FC2_VALUE!r}")
+SAVE_MLP_FC2 = SAVE_MLP_FC2_VALUE == "1"
 if CUSTOM_PREFIX_GRAD and FA4_EXACT:
     raise ValueError(
         "OMNI_FA3_CUSTOM_PREFIX_GRAD and OMNI_FA4_EXACT_BLOCK_CAUSAL "
@@ -52,6 +56,11 @@ if REPEATED_ADALN:
     from optimized_repeated_adaln import install_repeated_adaln_optimization
 
     install_repeated_adaln_optimization()
+
+if SAVE_MLP_FC2:
+    from optimized_selective_checkpoint import install_mlp_fc2_selective_checkpoint
+
+    install_mlp_fc2_selective_checkpoint()
 
 
 def _range_call(name, function, *args, **kwargs):

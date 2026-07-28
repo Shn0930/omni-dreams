@@ -213,17 +213,27 @@ def test_fused_fa4_matches_dense_forward_and_gradients(
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("context_factory_name", ["release", "save_mlp_fc2"])
 @pytest.mark.skipif(
     not _hopper_fa4_is_available(),
     reason="Commit-pinned FA4 CuTeDSL and a Hopper SM90 GPU are required",
 )
 def test_aggressive_sac_must_saves_fa4_and_does_not_recompute_forward(
     monkeypatch: pytest.MonkeyPatch,
+    context_factory_name: str,
 ) -> None:
     from omnidreams._src.predict2.networks.minimal_v4_dit import (
         predict2_2B_720_context_fn_aggressive,
     )
     from torch.utils.checkpoint import checkpoint
+    from optimized_selective_checkpoint import (
+        predict2_2b_720_context_fn_save_mlp_fc2,
+    )
+
+    context_factory = {
+        "release": predict2_2B_720_context_fn_aggressive,
+        "save_mlp_fc2": predict2_2b_720_context_fn_save_mlp_fc2,
+    }[context_factory_name]
 
     forward_calls = 0
     original_forward = backend._run_fa4_forward
@@ -256,7 +266,7 @@ def test_aggressive_sac_must_saves_fa4_and_does_not_recompute_forward(
         ),
         *inputs,
         use_reentrant=False,
-        context_fn=predict2_2B_720_context_fn_aggressive,
+        context_fn=context_factory,
         preserve_rng_state=False,
     )
     output.sum().backward()
