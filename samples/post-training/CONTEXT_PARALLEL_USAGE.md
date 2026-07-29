@@ -235,17 +235,6 @@ AdaLN 可以与任一 attention 路径组合。两项都只限制实验开关本
 `CP_SIZE=1`，不限制总 GPU 数；例如 `NPROC=8,FSDP_SIZE=8,CP_SIZE=1`
 仍是合法 topology。
 
-另有一个独立的 aggressive-SAC 显存换时间开关：
-
-- `OMNI_SAC_SAVE_MLP_FC2=1`：保留 attention output，并额外保存
-  Predict2-2B 主 MLP 的 FC2 output，消除每层一次 FC2 checkpoint replay。
-
-该策略按 `aten.mm([M,8192] × [8192,2048])` 识别 FC2，不固定 `M`、
-CP degree、序列长度或总 GPU 数。它只允许用于 `fa3-sac`；若调用者再用
-Hydra override 修改 SAC mode，launcher 会 fail-fast。93 帧、
-CP=1/FSDP=4 的同卡实测为约 `1.23–1.30%` iteration-time reduction，
-peak allocated 增加 `8.379 GiB`。
-
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
@@ -253,7 +242,6 @@ OMNI_FA4_OVERLAY=/path/to/fa4-overlay \
 OMNI_FA4_ACCEPT_UNSUPPORTED_PROTOBUF7=1 \
 OMNI_FA4_EXACT_BLOCK_CAUSAL=1 \
 OMNI_OPTIMIZE_REPEATED_ADALN=1 \
-OMNI_SAC_SAVE_MLP_FC2=1 \
   bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
 ```
 
@@ -382,7 +370,6 @@ NPROC=6 CP_SIZE=3 FSDP_SIZE=6 \
 | `OMNI_FA4_OVERLAY` | 未设置 | 位于 `OMNI_FA3_VENV` 外的 FA4 `--target` research overlay |
 | `OMNI_FA4_ACCEPT_UNSUPPORTED_PROTOBUF7` | `0` | 显式接受 CUTLASS DSL metadata 与仓库 protobuf 7 要求不一致；仅 research profiling |
 | `OMNI_OPTIMIZE_REPEATED_ADALN` | `0` | CP=1 frame-level AdaLN-LoRA 实验 |
-| `OMNI_SAC_SAVE_MLP_FC2` | `0` | `fa3-sac` 下仅保存 Predict2-2B 主 MLP FC2 output；以约 8.4 GiB peak memory 消除每层一次 replay |
 | `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR` | `$OMNI_CACHE_DIR/flash-attn-cute-dsl` | FA4 跨进程 persistent compile cache |
 
 默认 artifact 路径随实际 `NPROC` 和 launcher 类型变化：
@@ -460,7 +447,6 @@ entry，并保留 validation/checkpointer。不要复用 `fa3_profile_entry.py`�
 | `samples/post-training/optimized_block_causal_flash_attention.py` | sample-side CP=1 FA3 ragged-prefix custom autograd；不修改 release tree |
 | `samples/post-training/fa4_exact_block_causal_attention.py` | sample-side CP=1 fused exact FA4 backend；不修改 release tree |
 | `samples/post-training/optimized_repeated_adaln.py` | sample-side CP=1 frame-level AdaLN-LoRA；保持 checkpoint keys |
-| `samples/post-training/optimized_selective_checkpoint.py` | sample-side Predict2-2B FC2 selective-save SAC；不修改 release tree |
 
 ## 6. Nsight Systems profiling
 

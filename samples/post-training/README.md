@@ -219,8 +219,8 @@ implementation calls a private FA3 backward ABI; revalidate correctness and
 performance before changing that dependency. CP layout comparisons explicitly
 disable this switch.
 
-Additional CP=1 experiments address the remaining attention, AdaLN, and
-checkpoint-replay costs:
+Two additional CP=1 experiments address the remaining attention and AdaLN
+costs:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
@@ -229,7 +229,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
   OMNI_FA4_ACCEPT_UNSUPPORTED_PROTOBUF7=1 \
   OMNI_FA4_EXACT_BLOCK_CAUSAL=1 \
   OMNI_OPTIMIZE_REPEATED_ADALN=1 \
-  OMNI_SAC_SAVE_MLP_FC2=1 \
   bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
 ```
 
@@ -245,16 +244,6 @@ per latent frame before spatial expansion. It is mathematically equivalent,
 keeps checkpoint parameter names unchanged, and currently requires
 `CP_SIZE=1` with complete frame-aligned chunks. BF16 gradient reductions can
 differ slightly because the GEMM reduction order changes.
-
-`OMNI_SAC_SAVE_MLP_FC2=1` keeps the existing aggressive-SAC attention-save
-rule and additionally saves only the Predict2-2B main-MLP FC2 output
-(`[M,8192] @ [8192,2048]`). It does not fix `M`, the CP degree, the GPU count,
-or the sequence length. The switch is disabled by default, requires
-`fa3-sac`, and fails fast if a trailing Hydra override changes the SAC mode.
-In the 93-frame 4×H20 CP=1/FSDP=4 profile it removed one FC2 replay per layer:
-clean iteration 7–8 changed from `43.755` to `43.185 s` (about `1.30%` lower
-iteration time) while peak allocated memory changed from `54.465` to
-`62.844 GiB`.
 
 FA4 is a research-only profiling overlay, not a supported dependency of the
 post-training environment. `nvidia-cutlass-dsl-libs-base==4.6.0.dev0`
@@ -400,8 +389,6 @@ Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.
   block-causal FA4 CuTeDSL backend.
 - `optimized_repeated_adaln.py` — optional CP=1 frame-level AdaLN-LoRA
   computation with unchanged checkpoint keys.
-- `optimized_selective_checkpoint.py` — optional shape-aware aggressive-SAC
-  policy that saves only the Predict2-2B main-MLP FC2 output.
 - `fa4_env.sh` — commit-pinned FA4/CuTeDSL environment and persistent-cache
   validation.
 - `run_cp_attention_ab.sh` — configurable single-node Contiguous / Zigzag /

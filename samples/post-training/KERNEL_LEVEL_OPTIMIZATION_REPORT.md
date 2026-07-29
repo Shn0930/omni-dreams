@@ -6,8 +6,9 @@
 
 **基线 commit：** `7ad69cb763c41df62b96001faf06cd494ba2d80e`
 
-**范围：** single-view HDMap、93 帧、CP=1、FSDP=4、FA3/FA4 +
-frame-level AdaLN + optional FC2-selective SAC
+**范围：** single-view HDMap、93 帧、CP=1、FSDP=4、FA3/SAC、
+custom prefix gradient、frame-level AdaLN、exact FA4，以及已否决的
+FC2-selective SAC 实验
 
 ## 1. 结论
 
@@ -48,14 +49,16 @@ frame-level AdaLN + optional FC2-selective SAC
    production-ready 依赖。
 9. 对 `6.056 s/iter` 的 BF16 NVJET 做源码/调用序列拆分后，确认
    `1.969 s` 是 SAC forward replay，`4.086 s` 才是真正的 linear
-   backward。只保存主 MLP FC2 output 后，每层一个 replay 消失：
+   backward。实验性地只保存主 MLP FC2 output 后，每层一个 replay 消失：
    NVJET `843→815 launches/iter`，replay `1.96895→1.40820 s`，
    true backward 保持 `4.085 s`。
 10. protobuf 7.35.1 final overlay 的同卡 A/B 中，FC2-selective SAC 将
     clean iteration 7–8 从 `43.755` 降到 `43.185 s`
     (`-1.30%`，吞吐 `+1.32%`)，peak allocated
     `54.465→62.844 GiB`。若包含 iteration 6，收益为 `1.23%`；
-    因此保守结论写作约 `1.2–1.3%`。
+    因此保守结论写作约 `1.2–1.3%`。由于只换回约 `0.57 s` 却增加
+    `8.379 GiB` peak（约 `+15.4%`），该候选已否决，活动实现、开关、
+    测试和使用文档均已移除，不计入最终保留收益。
 11. FA4 sparse-Q `640` 让 hd=128 backward 从 fallback `m64` 改用
     native `m80`，但 production-shape alternating microbenchmark
     反而由 `559.233` 增至 `564.142 ms` (`+0.88%`)；该候选已否决并从
@@ -63,6 +66,27 @@ frame-level AdaLN + optional FC2-selective SAC
 
 RMSNorm finalize、NCCL 和 launch-to-start queue 都不是本轮主 blocker。
 完整第二阶段归因、实现和验证见 §10–§15。
+
+### 1.1 整体收益总览
+
+下面区分严格同卡增量 A/B 与同一软件栈下的参考端点；百分比不逐项相加。
+
+| 路径 | 对照 → 候选 | Iter 降时 | 吞吐提升 | 结论 |
+|---|---|---:|---:|---|
+| CP=1 第一阶段完整链路 | Flex + whole-block checkpoint `61.983 s` → FA3 + aggressive SAC + custom prefix `48.357 s` | `21.98%` | `28.18%` | 参考端点；不能从中单独拆出 FA3 与 SAC，custom prefix 本身只贡献 `0.589%` 降时 |
+| CP=1 frame-level AdaLN | custom-prefix control `48.330 s` → `44.523 s` | `7.876%` | `8.550%` | 保留；peak allocated `-2.175 GiB` |
+| CP=1 exact FA4 | AdaLN `44.523 s` → FA4 + AdaLN `43.823 s` | `1.572%` | `1.597%` | 保留为 research overlay；peak allocated `-0.320 GiB` |
+| **CP=1 最终保留组合** | **Flex `61.983 s` → FA4 exact + frame-level AdaLN + aggressive SAC `43.823 s`** | **`29.298%`** | **`41.438%`** | 同软件栈参考 headline；FA4 替代 custom-prefix backend，不包含 FC2-selective SAC |
+| CP=4 Zigzag | Contiguous `25.823 s` → `22.311 s` | `13.602%` | `15.74%` | 保留，可配置 CP size |
+| CP=4 Ulysses | Contiguous `25.823 s` → `22.088 s` | `14.467%` | `16.91%` | 保留；当前实测比 Zigzag 快约 `1%` |
+| FC2-selective SAC | `43.755 s` → `43.185 s` | `1.2–1.3%` | `1.25–1.32%` | **否决并移除**；peak `+8.379 GiB` |
+| FA4 sparse-Q/m80 | `559.233 ms` → `564.142 ms` backward | `-0.88%`（回退） | — | **否决并移除** |
+
+CP=1 与 CP=4 是不同拓扑，不能把 `29.298%` 与 `14–15%` 相加；早期
+8-GPU `61.021 s`、nsys GPU span/NVTX、NSYS=0 wall time，以及
+iteration 6–8/7–8 不同窗口也不能混算。
+CP=4 的完整实现、双向 A/B 和 all-rank nsys 见
+[CP4_ULYSSES_ZIGZAG_REPORT.md](./CP4_ULYSSES_ZIGZAG_REPORT.md)。
 
 ## 2. 实验配置
 
@@ -74,7 +98,7 @@ RMSNorm finalize、NCCL 和 launch-to-start queue 都不是本轮主 blocker。
 | 输入 | 93 帧，704×1280 |
 | DF | `state_t=24`，`num_frame_per_block=2` |
 | Attention | block-causal FA3 12 prefixes/layer；或 fused exact FA4 1 sparse call/layer |
-| Checkpoint | baseline 为 `predict2_2b_720_aggressive` SAC；候选只额外保存主 MLP FC2 output |
+| Checkpoint | 保留方案为 `predict2_2b_720_aggressive` SAC；§15 记录的 FC2 extra-save 候选已否决并删除 |
 | 软件 | Python 3.13.13、Torch 2.10.0+cu128、FA3-NV 1.0.3、FA4 `g14c377950` |
 | Driver | 580.95.05 |
 | NSYS=0 稳态窗口 | 历史表使用 iteration 6–8；final overlay clean window 同时报告 6–8 与 7–8 |
@@ -530,6 +554,8 @@ payload 为：
 
 而保存 FC1 output 需再增加 `36.09375 GiB`，FC1+FC2 合计
 `45.11719 GiB`，却只多回收约 `0.564 s`，因此首个候选只保存 FC2。
+该候选的实测和否决决定见 §15；最终活动代码没有保留 FC1 或 FC2
+extra-save policy。
 
 完整 SQL、调用序列和源码映射保存在：
 
@@ -581,8 +607,8 @@ nvjet_tst_128x256_64x4_2x1_v_bz_coopA_TNN
 
 因此 NNN proxy 的核心判断得到 exact-layout 复核：BF16 FC2 本身已是
 compute-bound。若保持相同 BF16 FLOP，换另一个 GEMM tile 的局部空间很小；
-本轮实际收益来自 SAC 直接删除 28 次 FC2 replay，而不是让单次 NVJET
-更快。
+实验中观测到的收益来自 SAC 直接删除 28 次 FC2 replay，而不是让单次
+NVJET 更快；由于显存性价比不足，这个实验性 policy 最终未保留。
 
 ### 11.2 FP32 AdaLN-LoRA
 
@@ -875,7 +901,7 @@ host/iteration 数据是同配置、同 nsys 口径的近似 A/B；§12–13 的
 非 profile 数据才是严格同卡 A/B。具体 kernel signature 的 launch/time
 变化可以直接归因。本节原始 FA4 + AdaLN nsys 采集于前述
 shared-venv/protobuf 6.33.5 环境；最终 protobuf 7 overlay 后续已经完成
-4-GPU NSYS=0 与 nsys 复测，新增 FC2-selective SAC 结果见 §15。
+4-GPU NSYS=0 与 nsys 复测，已否决的 FC2-selective SAC 实验见 §15。
 
 | 指标 | 旧 custom-prefix FA3 | FA4 + frame AdaLN | Delta |
 |---|---:|---:|---:|
@@ -959,9 +985,10 @@ launch 都不是主要方向。
    lower precision/FP8 或减少可见 history 才能实质降低 FLOP。
    sparse-Q `640` / backward `m80` 已实测回退 `0.88%`，不是有效候选。
 2. **继续减少 BF16 主干 GEMM 数学，而非局部调 NVJET。**
-   FC2-selective SAC 已实测回收约 `0.56 s`、增加 `8.379 GiB` peak，
-   详见 §15；FC1+FC2 需要约 `45.1 GiB` raw retention 才多回收约
-   `0.564 s`，性价比不足，当前拒绝。剩余 `4.085 s` true backward
+   FC2-selective SAC 虽回收约 `0.56 s`，但增加 `8.379 GiB` peak，
+   收益/显存与维护性价比不足，已经否决并从活动代码移除；FC1+FC2
+   更需要约 `45.1 GiB` raw retention 才多回收约 `0.564 s`。
+   剩余 `4.085 s` true backward
    包含 MLP dX/dW 与 self/cross projection 的多种 shape/layout；
    FP8/fused MLP、packed projection 或结构性共享是当前最高置信方向，
    但在排除所有 BF16 kernel/layout 调优前，仍需分别补抓 dominant
@@ -997,20 +1024,20 @@ critical-path GPU 工作才会缩短 queue。
     profile-action-digest.md
 ```
 
-最终回归：
+FC2 实验补丁移除后的最终回归：
 
 ```text
-CPU suite: 93 passed, 3 skipped, 7 GPU tests deselected
-Hopper GPU suite: 7 passed
+CPU suite: 83 passed, 3 skipped, 6 GPU tests deselected
+Hopper GPU suite: 6 passed
 ```
 
 GPU suite 包含 BF16/FP16、batch 1/2、head_dim 64/128、dense output 与
 dQ/dK/dV oracle、aggressive SAC 不重算、installer scope，以及实际
 `flash_attn.cute`/`cutlass` module path 必须位于独立 overlay 的断言。
 
-## 15. FC2-selective SAC follow-up（2026-07-29）
+## 15. FC2-selective SAC 否决实验（2026-07-29）
 
-### 15.1 原理与实现
+### 15.1 原理与实验补丁
 
 Predict2-2B 主 MLP 是 `2048→8192→2048`。当前 gated residual：
 
@@ -1019,17 +1046,18 @@ mlp_out = mlp(normed_x)
 x = x + gate_mlp * mlp_out
 ```
 
-使 checkpoint backward 必须 replay 到 FC2 output。新增 sample-side
-policy 保留原 attention `MUST_SAVE` 规则，并额外匹配：
+使 checkpoint backward 必须 replay 到 FC2 output。当时的临时
+sample-side 实验 policy 保留原 attention `MUST_SAVE` 规则，并额外匹配：
 
 ```text
 aten.mm([M,8192], [8192,2048])
 ```
 
 leading dimension `M` 不固定，因此 batch、sequence 和 CP degree 可变；
-其余 GEMM 继续 recompute。开关 `OMNI_SAC_SAVE_MLP_FC2=1` 只允许
-`fa3-sac`，并禁止尾部 Hydra 参数覆盖 SAC mode，避免 metadata 与实际
-policy 不一致。release tree 和 checkpoint parameter keys 均未修改。
+其余 GEMM 继续 recompute。实验只在 `fa3-sac` 下启用，并阻止 SAC mode
+被尾部 Hydra 参数覆盖。release tree 和 checkpoint parameter keys 始终
+未修改。A/B 完成后，因收益仅约 `1.2–1.3%`、peak 增加 `8.379 GiB`，
+该实验补丁及其 launcher 开关、测试和用户文档已经从最终分支移除。
 
 ### 15.2 protobuf 7 final-overlay 同卡 A/B
 
@@ -1044,7 +1072,7 @@ candidate 和 nsys 三次运行中均为：
 | 配置 | Iter 6 / 7 / 8 | Mean 6–8 | Clean mean 7–8 | Peak allocated |
 |---|---:|---:|---:|---:|
 | Aggressive SAC baseline | 44.77 / 43.76 / 43.75 s | 44.093 s | 43.755 s | 54.465 GiB |
-| + save MLP FC2 | 44.28 / 43.20 / 43.17 s | **43.550 s** | **43.185 s** | 62.844 GiB |
+| + save MLP FC2（已删除候选） | 44.28 / 43.20 / 43.17 s | **43.550 s** | **43.185 s** | 62.844 GiB |
 | Delta | -0.49 / -0.56 / -0.58 s | **-0.543 s / -1.23%** | **-0.570 s / -1.30%** | +8.379 GiB |
 
 对应吞吐提升为 `1.25%`（iter 6–8）或 `1.32%`（clean iter 7–8）。
@@ -1054,14 +1082,19 @@ candidate 和 nsys 三次运行中均为：
 
 实测 memory 增量 `8.379 GiB` 略低于 raw payload `9.023 GiB`，说明
 checkpoint storage 与其他 activation 峰值并非完全同一时刻存活；仍应把
-该开关视为明确的显存换时间策略。
+该候选视为明确的显存换时间策略。
+
+**决策：否决并移除。** 约 `1.2–1.3%` iteration-time reduction 不足以
+抵消 `+8.379 GiB`（约 `+15.4%`）peak memory 和额外维护复杂度，因此
+它不计入 §1.1 的最终保留收益。
 
 ### 15.3 nsys：只删除 replay，不删除 true backward
 
 候选为 final-overlay rank0 iteration 7/8；对照来自
 `df93_kernelopt_fa4_repeated_adaln_nsys_20260728_01` 的
 shared-venv/protobuf 6 trace。两者使用相同 GPU `1,2,3,6`、FA4 wheel、
-模型和 capture 配置，但依赖打包和 sample-side overlay 校验代码不同，
+模型、iteration 7–8 分析窗口和归因口径，但依赖打包、capture 起始
+iteration 和 sample-side overlay 校验代码不同，
 所以 host/iteration 数字属于近似 nsys A/B。§13.3 已证明两种依赖打包的
 NSYS=0 clean mean 只差 `0.020 s`；而下面精确少 28 个 NVJET launch、
 true backward 不变的 kernel 证据可以直接归因于 FC2 policy。
@@ -1108,8 +1141,8 @@ path 缩短而自然缩短；它依旧不是独立 idle hole。
 | Barrier | 27.72% |
 | Long scoreboard | 16.38% |
 
-该 exact-layout 结果确认 FC2 forward/replay NVJET 的局部 kernel 已接近 compute
-ceiling。低 occupancy 是 warp-specialized persistent GEMM 的资源布局，
+该 exact-layout 结果确认 FC2 forward/replay NVJET 的局部 kernel 已接近
+compute ceiling。低 occupancy 是 warp-specialized persistent GEMM 的资源布局，
 在 Math SOL `98.84%` 时不能单独当成优化目标。下一步若继续处理剩余
 `4.085 s` true backward，应优先评估降低计算量的 FP8/TE fused MLP、
 packed projections 或结构性共享。这个 profile 只覆盖 FC2 TNN，
@@ -1138,10 +1171,10 @@ kernel/layout 调优。
   fa4_sparse_q_schedule_m80_rejected.json
 ```
 
-最终定向回归：
+实验补丁删除前的历史定向回归：
 
 ```text
 Targeted FC2/FA4 subset: 22 CPU/dispatcher + 7 Hopper = 29 passed
-Full CPU suite: 93 passed, 3 skipped, 7 GPU tests deselected
+Full CPU suite at experiment time: 93 passed, 3 skipped, 7 GPU tests deselected
 4-GPU training: 8/8 iterations completed, finite matching loss
 ```
