@@ -198,6 +198,19 @@ post-training/data/{video,hdmap,caption}/
 | `fa3` | FA3 | Contiguous | whole-block |
 | `fa3-sac` | FA3 | Contiguous | aggressive SAC |
 
+Frame-level AdaLN is an independent CP=1 optimization:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
+OMNI_OPTIMIZE_REPEATED_ADALN=1 \
+  bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
+```
+
+It computes each pointwise AdaLN-LoRA MLP on `[B,T,D]` before spatial
+expansion, preserves checkpoint keys, and fails fast for CP>1 or partial-frame
+KV-cache chunks.
+
 ### 4.3 并行参数和默认值
 
 两个 launcher 都使用相同的并行参数：
@@ -308,6 +321,7 @@ NPROC=6 CP_SIZE=3 FSDP_SIZE=6 \
 | `NSYS_BIN` | 从 `PATH` 查找 | 自定义 `nsys` 可执行文件 |
 | `PROFILE_FIRST` | CP launcher: `7`; FA3 launcher: `6` | nsys capture 首个 iteration |
 | `PROFILE_LAST` | `MAX_ITER` | nsys capture 最后一个 iteration |
+| `OMNI_OPTIMIZE_REPEATED_ADALN` | `0` | 仅 FA3 launcher 的 CP=1 Frame-level AdaLN 开关；只接受 `0`/`1` |
 
 默认 artifact 路径随实际 `NPROC` 和 launcher 类型变化：
 
@@ -381,6 +395,7 @@ entry，并保留 validation/checkpointer。不要复用 `fa3_profile_entry.py`�
 | `networks/causal_cosmos_hdmap.py` | HDMap 网络的相同训练路径 |
 | `models/joint_causal_cosmos_model.py` | `split_cp_in_model` 防二次分片校验 |
 | `networks/causal_crossview_cosmos.py` | 明确拒绝尚未支持的 multiview 组合 |
+| `samples/post-training/optimized_repeated_adaln.py` | sample-side CP=1 Frame-level AdaLN-LoRA；保持 checkpoint keys |
 
 ## 6. Nsight Systems profiling
 

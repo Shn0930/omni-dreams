@@ -13,7 +13,19 @@ from omnidreams._src.imaginaire.utils.callback import NVTXCallback
 FIRST = int(os.environ.get("OMNI_PROFILE_FIRST", "6"))
 LAST = int(os.environ.get("OMNI_PROFILE_LAST", "8"))
 CAPTURE = os.environ.get("OMNI_PROFILE_CAPTURE", "0") == "1"
+REPEATED_ADALN_VALUE = os.environ.get("OMNI_OPTIMIZE_REPEATED_ADALN", "0")
+if REPEATED_ADALN_VALUE not in {"0", "1"}:
+    raise ValueError(
+        "OMNI_OPTIMIZE_REPEATED_ADALN must be 0 or 1, "
+        f"got {REPEATED_ADALN_VALUE!r}"
+    )
+REPEATED_ADALN = REPEATED_ADALN_VALUE == "1"
 _original_after_backward = NVTXCallback.on_after_backward
+
+if REPEATED_ADALN:
+    from optimized_repeated_adaln import install_repeated_adaln_optimization
+
+    install_repeated_adaln_optimization()
 
 
 def _range_call(name, function, *args, **kwargs):

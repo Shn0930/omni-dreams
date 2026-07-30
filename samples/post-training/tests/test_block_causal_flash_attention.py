@@ -82,3 +82,90 @@ def test_flash3_matches_dense_block_causal_forward_and_gradients(
             atol=6e-2,
             rtol=6e-2,
         )
+
+
+def test_spatially_repeated_adaln_matches_pointwise_reference() -> None:
+    from copy import deepcopy
+
+    from optimized_repeated_adaln import SpatiallyRepeatedSequential
+
+    torch.manual_seed(31)
+    repeat_factor = 7
+    per_frame = torch.randn(2, 3, 32, dtype=torch.float32, requires_grad=True)
+    optimized_input = per_frame.detach().clone().requires_grad_(True)
+    reference = torch.nn.Sequential(
+        torch.nn.SiLU(),
+        torch.nn.Linear(32, 8, bias=False),
+        torch.nn.Linear(8, 96, bias=False),
+    )
+    optimized = SpatiallyRepeatedSequential(*deepcopy(list(reference.children())))
+    optimized.set_spatial_repeat_factor(repeat_factor)
+    output_gradient = torch.randn(2, 3 * repeat_factor, 96)
+
+    reference_output = reference(per_frame.repeat_interleave(repeat_factor, dim=1))
+    optimized_output = optimized(optimized_input.repeat_interleave(repeat_factor, dim=1))
+    reference_output.backward(output_gradient)
+    optimized_output.backward(output_gradient)
+
+    torch.testing.assert_close(optimized_output, reference_output)
+    torch.testing.assert_close(optimized_input.grad, per_frame.grad, atol=2e-5, rtol=2e-5)
+    for optimized_parameter, reference_parameter in zip(
+        optimized.parameters(),
+        reference.parameters(),
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            optimized_parameter.grad,
+            reference_parameter.grad,
+            atol=2e-5,
+            rtol=2e-5,
+        )
+
+
+def test_spatially_repeated_adaln_preserves_state_dict_layout() -> None:
+    from optimized_repeated_adaln import SpatiallyRepeatedSequential
+
+    reference = torch.nn.Sequential(
+        torch.nn.SiLU(),
+        torch.nn.Linear(16, 4, bias=False),
+        torch.nn.Linear(4, 48, bias=False),
+    )
+    optimized = SpatiallyRepeatedSequential(*list(reference.children()))
+
+    assert list(optimized.state_dict()) == ["1.weight", "2.weight"]
+
+
+def test_repeated_adaln_extracts_positional_and_keyword_call_context() -> None:
+    from optimized_repeated_adaln import (
+        _extract_inference_range,
+        _extract_video_size,
+    )
+
+    positional = tuple(range(14))
+    assert _extract_video_size(positional, {}) == 13
+    assert _extract_video_size(positional, {"video_size": "keyword"}) == "keyword"
+    assert _extract_inference_range(positional, {}) == (7, 9, 10)
+    assert _extract_inference_range(
+        positional,
+        {
+            "kv_cache": "cache",
+            "current_start": 21,
+            "current_end": 42,
+        },
+    ) == ("cache", 21, 42)
+
+
+def test_repeated_adaln_rejects_partial_frame_kv_cache_chunks() -> None:
+    from optimized_repeated_adaln import _validate_frame_alignment
+
+    _validate_frame_alignment(
+        (),
+        {"kv_cache": {}, "current_start": 32, "current_end": 64},
+        16,
+    )
+    with pytest.raises(ValueError, match="latent-frame boundaries"):
+        _validate_frame_alignment(
+            (),
+            {"kv_cache": {}, "current_start": 1, "current_end": 33},
+            16,
+        )

@@ -139,6 +139,10 @@ the top of the file.
 
 ### Optional configurable FlashAttention-3 profiling
 
+For a concise overview of the retained FA3, SAC, context-parallel, and
+Frame-level AdaLN changes and their measured gains, see the
+[training optimization summary](./TRAINING_OPTIMIZATION_SUMMARY.md).
+
 The single-node profiling launchers are configurable rather than tied to a
 particular GPU count:
 
@@ -200,6 +204,21 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 NSYS=1 \
   NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
   bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
 ```
+
+The CP=1 Frame-level AdaLN optimization can be enabled independently:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  NPROC=4 CP_SIZE=1 FSDP_SIZE=4 \
+  OMNI_OPTIMIZE_REPEATED_ADALN=1 \
+  bash samples/post-training/run_fa3_attention_ab.sh fa3-sac
+```
+
+It evaluates each pointwise AdaLN-LoRA MLP once per latent frame before
+spatial expansion. The wrapper keeps parameter names and checkpoint layout
+unchanged, requires complete frame-aligned chunks, and currently supports
+`CP_SIZE=1` only. Reduced-precision gradient reductions can differ slightly
+because the GEMM reduction order changes.
 
 `flash-attn-3-nv` is a BSD-3-Clause dependency supplied by the pinned Cosmos
 Framework lock. A run with `CP_SIZE=1` keeps context parallelism disabled;
@@ -284,6 +303,8 @@ Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.
   `_${LOCAL_RANK}` to `TRITON_CACHE_BASE` so 8 ranks never share a hash dir.
 - `run_fa3_attention_ab.sh` — configurable single-node FlexAttention / FA3 /
   FA3+SAC component A/B launcher using the contiguous layout.
+- `optimized_repeated_adaln.py` — optional CP=1 Frame-level AdaLN-LoRA
+  computation with unchanged checkpoint keys.
 - `run_cp_attention_ab.sh` — configurable single-node Contiguous / Zigzag /
   Ulysses context-parallel correctness and performance launcher.
 - `run_fa3_cp1_ab.sh` and `run_cp4_attention_ab.sh` — compatibility wrappers
@@ -294,6 +315,8 @@ Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.
   and Ulysses runs.
 - `CP4_ULYSSES_ZIGZAG_REPORT.md` — implementation, two-run A/B, memory, and
   all-rank nsys findings for the historical CP=4 benchmark.
+- `TRAINING_OPTIMIZATION_SUMMARY.md` — concise implementation and benchmark
+  summary for the retained FA3, SAC, context-parallel, and AdaLN changes.
 - `prepare.py` — `snapshot_download`s the HF sample dataset and symlinks its
   per-scene files into the per-camera layout the dataloader expects. Invoked
   by `setup_env.sh`.

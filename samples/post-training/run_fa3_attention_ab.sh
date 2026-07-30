@@ -124,6 +124,15 @@ export TRITON_CACHE_BASE="${TRITON_CACHE_BASE:-$OMNI_CACHE_DIR/triton/$JOB_NAME}
 export OMNI_PROFILE_FIRST="$PROFILE_FIRST"
 export OMNI_PROFILE_LAST="$PROFILE_LAST"
 export OMNI_PROFILE_CAPTURE="$NSYS"
+export OMNI_OPTIMIZE_REPEATED_ADALN="${OMNI_OPTIMIZE_REPEATED_ADALN:-0}"
+if [[ "$OMNI_OPTIMIZE_REPEATED_ADALN" != "0" && "$OMNI_OPTIMIZE_REPEATED_ADALN" != "1" ]]; then
+  echo "ERROR: OMNI_OPTIMIZE_REPEATED_ADALN must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$OMNI_OPTIMIZE_REPEATED_ADALN" == "1" && "$CP_SIZE" != "1" ]]; then
+  echo "ERROR: OMNI_OPTIMIZE_REPEATED_ADALN=1 currently supports CP_SIZE=1 only." >&2
+  exit 2
+fi
 
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/_env.sh"
@@ -159,6 +168,8 @@ fi
   echo "max_iter=$MAX_ITER"
   echo "profile_first=$PROFILE_FIRST"
   echo "profile_last=$PROFILE_LAST"
+  echo "repeated_adaln_requested=$OMNI_OPTIMIZE_REPEATED_ADALN"
+  echo "repeated_adaln_effective=$OMNI_OPTIMIZE_REPEATED_ADALN"
   echo "cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
   echo "git_branch=$(git -C "$REPO_ROOT" branch --show-current)"
   echo "git_head=$(git -C "$REPO_ROOT" rev-parse HEAD)"
@@ -184,6 +195,7 @@ PY
   sha256sum \
     "$SCRIPT_DIR/fa3_env.sh" \
     "$SCRIPT_DIR/fa3_profile_entry.py" \
+    "$SCRIPT_DIR/optimized_repeated_adaln.py" \
     "$SCRIPT_DIR/run_fa3_attention_ab.sh" \
     "$REPO_ROOT/post-training/omnidreams/_src/imaginaire/utils/context_parallel.py" \
     "$REPO_ROOT/post-training/omnidreams/_src/omnidreams/modules/block_causal_flash_attention.py" \
