@@ -37,7 +37,10 @@ from omnidreams._src.omnidreams.modules.block_causal_flash_attention import (
     ulysses_block_causal_flash_attention,
 )
 from omnidreams._src.omnidreams.modules.flex_attention import flex_attention_cp
-from omnidreams._src.omnidreams.modules.ulysses_attention import UlyssesCPManager
+from omnidreams._src.omnidreams.modules.ulysses_attention import (
+    ULYSSES_ATTENTION_BACKENDS,
+    UlyssesCPManager,
+)
 from omnidreams._src.predict2.conditioner import DataType
 from omnidreams._src.predict2.networks.minimal_v4_dit import (
     Attention,
@@ -118,9 +121,11 @@ class CausalSelfAttention(nn.Module):
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
-        if training_attention_backend not in {"flex", "flash_attn_3"}:
+        supported_training_backends = {"flex", *ULYSSES_ATTENTION_BACKENDS}
+        if training_attention_backend not in supported_training_backends:
             raise ValueError(
-                f"Invalid training_attention_backend={training_attention_backend!r}; expected 'flex' or 'flash_attn_3'"
+                f"Invalid training_attention_backend={training_attention_backend!r}; "
+                f"expected one of {sorted(supported_training_backends)}"
             )
         self.training_attention_backend = training_attention_backend
         self.num_frame_per_block = 1
@@ -231,20 +236,20 @@ class CausalSelfAttention(nn.Module):
         v = self.v_proj(x).view(b, s, n, d)
 
         if kv_cache is None:
-            # Training mode: use FlexAttention or the FlashAttention-3
+            # Training mode: use FlexAttention or the FlashAttention
             # block-prefix decomposition.
             roped_q, roped_k = self._apply_rope(q, k, rope_emb)
             roped_q = roped_q.type_as(v)
             roped_k = roped_k.type_as(v)
 
-            if self.training_attention_backend == "flash_attn_3":
+            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
                 cp_size = self.ulysses_cp_manager.size
                 if video_size is None:
-                    raise ValueError("video_size is required by the FlashAttention-3 block-causal backend")
+                    raise ValueError("video_size is required by the block-causal FlashAttention backend")
                 expected_sequence_length = video_size.T * video_size.H * video_size.W
                 if s * cp_size != expected_sequence_length:
                     raise ValueError(
-                        "The FlashAttention-3 block-causal backend received an unexpected local sequence: "
+                        "The block-causal FlashAttention backend received an unexpected local sequence: "
                         f"got {s} tokens on CP={cp_size}, expected global length "
                         f"{expected_sequence_length} from video_size={video_size}"
                     )
@@ -256,6 +261,7 @@ class CausalSelfAttention(nn.Module):
                     v,
                     tokens_per_block=tokens_per_block,
                     cp_manager=self.ulysses_cp_manager,
+                    attention_backend=self.training_attention_backend,
                 )
             else:
                 # Pad each CP rank's sequence to a multiple of 128 for FlexAttention.
@@ -1054,9 +1060,9 @@ class CosmosCausalDiT(WeightTrainingStat):
                 img_context_emb=img_context_emb,
             )
         else:
-            if self.training_attention_backend == "flash_attn_3" and num_interleave != 0:
+            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS and num_interleave != 0:
                 raise NotImplementedError(
-                    "The FlashAttention-3 block-causal training backend does not support num_interleave > 0"
+                    "The block-causal FlashAttention training backends do not support num_interleave > 0"
                 )
             return self._forward_train(
                 x_B_C_T_H_W=x_B_C_T_H_W,
@@ -1093,15 +1099,15 @@ class CosmosCausalDiT(WeightTrainingStat):
 
         mask_key = f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}_cp{cp_size}"
 
-        if self.training_attention_backend == "flash_attn_3":
+        if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
             if num_interleave != 0:
                 raise NotImplementedError(
-                    "The FlashAttention-3 block-causal training backend does not support num_interleave > 0"
+                    "The block-causal FlashAttention training backends do not support num_interleave > 0"
                 )
             self.ulysses_cp_manager.validate_num_heads(self.num_heads)
             if self.patch_temporal != 1:
                 raise NotImplementedError(
-                    "The FlashAttention-3 block-causal training backend currently requires patch_temporal=1"
+                    "The block-causal FlashAttention training backends currently require patch_temporal=1"
                 )
             block_mask = None
         else:
@@ -1181,7 +1187,7 @@ class CosmosCausalDiT(WeightTrainingStat):
         # Context parallel: split inputs
         cp_enabled = self._is_context_parallel_enabled and self.cp_group is not None
         if cp_enabled and self.cp_group.size() > 1:
-            if self.training_attention_backend == "flash_attn_3":
+            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
                 split_sequence = self.ulysses_cp_manager.split_sequence
                 x_B_L_D = split_sequence(x_B_L_D, dim=1)
                 t_emb_B_L_D = split_sequence(t_emb_B_L_D, dim=1)
@@ -1254,7 +1260,7 @@ class CosmosCausalDiT(WeightTrainingStat):
         # Context parallel: gather outputs
         if cp_enabled and self.cp_group is not None:
             # Gather before FinalLayer
-            if self.training_attention_backend == "flash_attn_3":
+            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
                 x_B_L_D = self.ulysses_cp_manager.gather_sequence_with_grad(x_B_L_D, dim=1)
             else:
                 x_B_L_D = cat_outputs_cp_with_grad(x_B_L_D, seq_dim=1, cp_group=self.cp_group)

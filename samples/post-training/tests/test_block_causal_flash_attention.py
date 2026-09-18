@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Correctness tests for the FlashAttention-3 block-causal backend."""
+"""Correctness tests for the FlashAttention block-causal backends."""
 
 import math
 
 import pytest
 import torch
 from omnidreams._src.omnidreams.modules.block_causal_flash_attention import (
+    _run_flash_attention,
     block_causal_flash_attention,
 )
 
@@ -35,18 +36,55 @@ def _dense_block_causal_reference(
 
 
 @pytest.mark.parametrize("tokens_per_block", [0, -1])
-def test_flash3_rejects_non_positive_block_size(tokens_per_block: int) -> None:
+def test_flash_attention_rejects_non_positive_block_size(tokens_per_block: int) -> None:
     inputs = [torch.empty((1, 1, 1, 64)) for _ in range(3)]
 
     with pytest.raises(ValueError, match="tokens_per_block must be positive"):
         block_causal_flash_attention(*inputs, tokens_per_block=tokens_per_block)
 
 
-def test_flash3_rejects_empty_sequence() -> None:
+def test_flash_attention_rejects_empty_sequence() -> None:
     inputs = [torch.empty((1, 0, 1, 64)) for _ in range(3)]
 
     with pytest.raises(ValueError, match="requires a non-empty sequence"):
         block_causal_flash_attention(*inputs, tokens_per_block=1)
+
+
+def test_flash_attention_rejects_unknown_backend() -> None:
+    inputs = [torch.empty((1, 1, 1, 64)) for _ in range(3)]
+
+    with pytest.raises(ValueError, match="Invalid FlashAttention backend"):
+        block_causal_flash_attention(
+            *inputs,
+            tokens_per_block=1,
+            attention_backend="unknown",
+        )
+
+
+def test_flash4_unwraps_public_api_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    query, key, value = [torch.randn((1, 2, 1, 8)) for _ in range(3)]
+    expected = torch.randn_like(query)
+
+    def fake_flash4(q, k, v, *, causal):
+        assert q is query
+        assert k is key
+        assert v is value
+        assert causal is False
+        return expected, torch.empty(0)
+
+    monkeypatch.setattr(
+        "omnidreams._src.omnidreams.modules.block_causal_flash_attention._load_flash4_attention",
+        lambda: fake_flash4,
+    )
+
+    actual = _run_flash_attention(
+        query,
+        key,
+        value,
+        attention_backend="flash_attn_4",
+    )
+
+    assert actual is expected
 
 
 @pytest.mark.parametrize(
@@ -60,16 +98,21 @@ def test_flash3_rejects_empty_sequence() -> None:
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", ["flash_attn_3", "flash_attn_4"])
 @pytest.mark.skipif(
     not _hopper_is_available(),
-    reason="FlashAttention-3 requires a Hopper (SM90) GPU",
+    reason="The FlashAttention integration test requires a Hopper (SM90) GPU",
 )
-def test_flash3_matches_dense_block_causal_forward_and_gradients(
+def test_flash_attention_matches_dense_block_causal_forward_and_gradients(
     shape: tuple[int, int, int, int],
     tokens_per_block: int,
     dtype: torch.dtype,
+    backend: str,
 ) -> None:
-    pytest.importorskip("flash_attn_3_nv")
+    if backend == "flash_attn_3":
+        pytest.importorskip("flash_attn_3_nv")
+    else:
+        pytest.importorskip("flash_attn.cute")
 
     torch.manual_seed(7)
     actual_inputs = [
@@ -81,6 +124,7 @@ def test_flash3_matches_dense_block_causal_forward_and_gradients(
     actual = block_causal_flash_attention(
         *actual_inputs,
         tokens_per_block=tokens_per_block,
+        attention_backend=backend,
     )
     reference = _dense_block_causal_reference(
         *reference_inputs,

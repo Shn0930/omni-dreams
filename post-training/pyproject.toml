@@ -43,8 +43,17 @@ dependencies = [
 cu128 = [
   "cosmos-oss[cu128_torch27]",
   "flash-attn-3-nv==1.0.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # b27+ pulls a Quack runtime that uses Torch dtypes introduced after 2.7.
+  "flash-attn-4==4.0.0b26; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # Direct dev-version pins let uv resolve b26's matching CuTe DSL runtime
+  # without enabling unrelated pre-release packages globally.
+  "nvidia-cutlass-dsl==4.6.0.dev0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "nvidia-cutlass-dsl-libs-base==4.6.0.dev0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
-cu130 = ["cosmos-oss[cu130_torch29]"]
+cu130 = [
+  "cosmos-oss[cu130_torch29]",
+  "flash-attn-4[cu13]==4.0.0b31; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [dependency-groups]
 dev = ["cosmos-oss[dev]"]

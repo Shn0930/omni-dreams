@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Distributed forward/gradient oracle for Ulysses FlashAttention-3.
+"""Distributed forward/gradient oracle for Ulysses FlashAttention-3/4.
 
 Run from ``post-training`` in the CUDA 12.8 environment:
 
@@ -20,6 +20,7 @@ from omnidreams._src.omnidreams.modules.block_causal_flash_attention import (
     ulysses_block_causal_flash_attention,
 )
 from omnidreams._src.omnidreams.modules.ulysses_attention import (
+    ULYSSES_ATTENTION_BACKENDS,
     UlyssesCPManager,
     head_to_sequence,
     sequence_to_head,
@@ -60,7 +61,12 @@ def _test_a2a_identity(device: torch.device, rank: int, world_size: int) -> None
     torch.testing.assert_close(local_x.grad, weights)
 
 
-def _test_flash3_oracle(device: torch.device, rank: int, world_size: int) -> None:
+def _test_flash_attention_oracle(
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    attention_backend: str,
+) -> None:
     batch, sequence, heads, head_dim = 1, 24 * world_size, 2 * world_size, 64
     tokens_per_block = 8
     generator = torch.Generator(device=device).manual_seed(20260918)
@@ -94,11 +100,13 @@ def _test_flash3_oracle(device: torch.device, rank: int, world_size: int) -> Non
         *local_inputs,
         tokens_per_block=tokens_per_block,
         cp_manager=UlyssesCPManager(dist.group.WORLD),
+        attention_backend=attention_backend,
     )
     reference_inputs = [x.detach().clone().requires_grad_(True) for x in global_inputs]
     reference_output = block_causal_flash_attention(
         *reference_inputs,
         tokens_per_block=tokens_per_block,
+        attention_backend=attention_backend,
     )
     torch.testing.assert_close(
         _gather_sequence(local_output.detach(), world_size).float(),
@@ -123,6 +131,12 @@ def main() -> None:
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size < 2:
         raise RuntimeError("The Ulysses correctness oracle requires at least two ranks")
+    attention_backend = os.getenv("ATTENTION_BACKEND", "flash_attn_3")
+    if attention_backend not in ULYSSES_ATTENTION_BACKENDS:
+        raise ValueError(
+            f"ATTENTION_BACKEND must be one of {sorted(ULYSSES_ATTENTION_BACKENDS)}, "
+            f"got {attention_backend!r}"
+        )
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -132,9 +146,17 @@ def main() -> None:
     try:
         _test_a2a_identity(device, dist.get_rank(), world_size)
         dist.barrier()
-        _test_flash3_oracle(device, dist.get_rank(), world_size)
+        _test_flash_attention_oracle(
+            device,
+            dist.get_rank(),
+            world_size,
+            attention_backend,
+        )
         if dist.get_rank() == 0:
-            print(f"PASS: Ulysses CP={world_size} forward and gradients", flush=True)
+            print(
+                f"PASS: {attention_backend} Ulysses CP={world_size} forward and gradients",
+                flush=True,
+            )
     finally:
         dist.destroy_process_group()
 

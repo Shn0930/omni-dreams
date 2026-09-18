@@ -1383,8 +1383,8 @@ class CausalCrossViewCosmosDiT(CosmosCausalDiT):
     ):
         if kwargs.get("training_attention_backend", "flex") != "flex":
             raise NotImplementedError(
-                "The FlashAttention-3 block-causal training backend is currently implemented "
-                "for single-view models only; cross-view blocks still use FlexAttention"
+                "FlashAttention block-causal training backends are currently implemented only "
+                "for single-view models; cross-view blocks still use FlexAttention"
             )
         self.state_t = state_t
         self.n_cameras_emb = n_cameras_emb

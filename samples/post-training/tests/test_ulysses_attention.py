@@ -83,9 +83,13 @@ def test_ulysses_manager_replicates_pre_network_inputs(monkeypatch: pytest.Monke
 
 @pytest.mark.parametrize(
     ("backend", "configured_split", "expected"),
-    [("flash_attn_3", True, False), ("flex", True, True)],
+    [
+        ("flash_attn_3", True, False),
+        ("flash_attn_4", True, False),
+        ("flex", True, True),
+    ],
 )
-def test_fa3_owns_model_input_partition_policy(
+def test_flash_attention_owns_model_input_partition_policy(
     backend: str, configured_split: bool, expected: bool
 ) -> None:
     model = SimpleNamespace(
@@ -96,15 +100,17 @@ def test_fa3_owns_model_input_partition_policy(
     assert CausalJointCosmosModel.split_cp_model_inputs.fget(model) is expected
 
 
-def test_self_forcing_fa3_keeps_pre_network_inputs_replicated(
+@pytest.mark.parametrize("backend", ["flash_attn_3", "flash_attn_4"])
+def test_self_forcing_flash_attention_keeps_pre_network_inputs_replicated(
     monkeypatch: pytest.MonkeyPatch,
+    backend: str,
 ) -> None:
     process_group = _FakeProcessGroup(2)
     condition = _FakeCondition()
     tensors = tuple(torch.randn(1, 4) for _ in range(3))
     enabled_groups = []
     net = SimpleNamespace(
-        training_attention_backend="flash_attn_3",
+        training_attention_backend=backend,
         enable_context_parallel=enabled_groups.append,
         disable_context_parallel=lambda: None,
     )
@@ -113,7 +119,9 @@ def test_self_forcing_fa3_keeps_pre_network_inputs_replicated(
     monkeypatch.setattr(
         self_forcing_dmd,
         "broadcast_split_tensor",
-        lambda *args, **kwargs: pytest.fail("FA3 self-forcing must not pre-split model inputs"),
+        lambda *args, **kwargs: pytest.fail(
+            "FlashAttention self-forcing must not pre-split model inputs"
+        ),
     )
     monkeypatch.setattr(ulysses_attention, "broadcast", lambda tensor, group: tensor)
 
@@ -138,7 +146,7 @@ def test_cp1_ulysses_adapter_bypasses_communication(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(
         block_causal_flash_attention,
         "block_causal_flash_attention",
-        lambda query, key, value, *, tokens_per_block: query,
+        lambda query, key, value, *, tokens_per_block, attention_backend: query,
     )
 
     output = block_causal_flash_attention.ulysses_block_causal_flash_attention(
@@ -150,9 +158,11 @@ def test_cp1_ulysses_adapter_bypasses_communication(monkeypatch: pytest.MonkeyPa
     assert output is inputs[0]
 
 
+@pytest.mark.parametrize("backend", ["flash_attn_3", "flash_attn_4"])
 @pytest.mark.parametrize(("cp_size", "video_t"), [(1, 1), (2, 2)])
 def test_causal_attention_dispatches_to_unified_ulysses_adapter(
     monkeypatch: pytest.MonkeyPatch,
+    backend: str,
     cp_size: int,
     video_t: int,
 ) -> None:
@@ -160,7 +170,7 @@ def test_causal_attention_dispatches_to_unified_ulysses_adapter(
         query_dim=64,
         n_heads=4,
         head_dim=16,
-        training_attention_backend="flash_attn_3",
+        training_attention_backend=backend,
     )
     process_group = None if cp_size == 1 else _FakeProcessGroup(cp_size)
     attention.cp_group = process_group
@@ -171,12 +181,21 @@ def test_causal_attention_dispatches_to_unified_ulysses_adapter(
 
     called = False
 
-    def fake_ulysses(query, key, value, *, tokens_per_block, cp_manager):
+    def fake_ulysses(
+        query,
+        key,
+        value,
+        *,
+        tokens_per_block,
+        cp_manager,
+        attention_backend,
+    ):
         nonlocal called
         called = True
         assert query.shape == key.shape == value.shape == (1, 8, 4, 16)
         assert tokens_per_block == 8
         assert cp_manager is attention.ulysses_cp_manager
+        assert attention_backend == backend
         return query
 
     monkeypatch.setattr(causal_cosmos, "ulysses_block_causal_flash_attention", fake_ulysses)

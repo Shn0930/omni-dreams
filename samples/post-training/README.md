@@ -137,28 +137,35 @@ commented placeholders for `--account` and `--partition`. Either pass them
 on the `sbatch` command line, or uncomment and edit the `##SBATCH` lines at
 the top of the file.
 
-### Optional FlashAttention-3 training backend
+### Optional FlashAttention-3/4 training backends
 
-The CUDA 12.8 extra installs the x86_64 `flash-attn-3-nv` wheel with the rest
-of the release environment:
+The CUDA extras install their compatible FlashAttention packages with the rest
+of the release environment. CUDA 12.8 includes FA3-NV and a PyTorch 2.7-compatible
+FA4 release; CUDA 13.0 includes the current FA4 CUDA 13 release:
 
 ```bash
 uv sync --project post-training --extra cu128
+# Or, for the CUDA 13.0 / PyTorch 2.9 stack:
+uv sync --project post-training --extra cu130
 ```
 
-Set `model.config.net.training_attention_backend=flash_attn_3` to enable the
-backend. CP=1 uses block-prefix FA3 directly. CP>1 uses Ulysses all-to-all to
-transform rank-local sequence shards from `[B, S/CP, H, D]` to balanced
-full-sequence head shards `[B, S, H/CP, D]`, then restores the local sequence
-layout after attention. The Ulysses CP manager keeps pre-network inputs
-replicated and owns the single post-patch sequence partition, regardless of
-the legacy `model.config.split_cp_in_model` setting. `num_heads` must be
-divisible by the CP size.
+Set `model.config.net.training_attention_backend=flash_attn_3` or
+`model.config.net.training_attention_backend=flash_attn_4` to select a backend.
+CP=1 uses block-prefix FlashAttention directly. CP>1 uses the same Ulysses
+all-to-all adapter for both backends: it transforms rank-local sequence shards
+from `[B, S/CP, H, D]` to balanced full-sequence head shards
+`[B, S, H/CP, D]`, then restores the local sequence layout after attention.
+The Ulysses CP manager keeps pre-network inputs replicated and owns the single
+post-patch sequence partition, regardless of the legacy
+`model.config.split_cp_in_model` setting. `num_heads` must be divisible by the
+CP size.
 
-The backend is supported for BF16/FP16 single-view, non-interleaved causal
-training with `patch_temporal=1` on x86_64 Hopper (SM90). The default remains
-`flex`. The CUDA 13.0 / PyTorch 2.9 dependency index does not currently ship a
-matching `flash-attn-3-nv` wheel.
+These backends support BF16/FP16 single-view, non-interleaved causal training
+with `patch_temporal=1`. FA3-NV is available only in the x86_64 CUDA 12.8 extra
+and requires Hopper (SM90). FA4 is an upstream alpha release for Hopper and
+Blackwell; it uses CuTe DSL JIT compilation on the first call. The default
+remains `flex`, and this integration deliberately uses dense block-prefix calls
+rather than FA4's experimental block-sparse API.
 
 ## Required env on compute nodes
 

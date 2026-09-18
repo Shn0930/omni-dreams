@@ -27,7 +27,10 @@ from omnidreams._src.imaginaire.utils.count_params import count_params
 from omnidreams._src.imaginaire.utils.ema import FastEmaModelUpdater
 from omnidreams._src.imaginaire.utils.fsdp_helper import hsdp_device_mesh
 from omnidreams._src.imaginaire.utils.optim_instantiate import get_base_scheduler
-from omnidreams._src.omnidreams.modules.ulysses_attention import UlyssesCPManager
+from omnidreams._src.omnidreams.modules.ulysses_attention import (
+    ULYSSES_ATTENTION_BACKENDS,
+    UlyssesCPManager,
+)
 from omnidreams._src.omnidreams.self_forcing.utils import (
     build_net,
     load_consolidated_pt_to_net,
@@ -798,15 +801,15 @@ class ImaginaireDMDBaseModel(ImaginaireModel):
         """
         Broadcast and split the input data and condition for model parallelism.
 
-        FA3 causal keeps inputs replicated and delegates the only token split
-        to its Ulysses manager after patch embedding. Other networks retain the
-        legacy pre-network temporal split.
+        FA3/FA4 causal keep inputs replicated and delegate the only token split
+        to their Ulysses manager after patch embedding. Other networks retain
+        the legacy pre-network temporal split.
         """
         cp_group = self.get_context_parallel_group()
         cp_size = 1 if cp_group is None else cp_group.size()
         if condition.is_video and cp_size > 1:
             training_attention_backend = getattr(self.net, "training_attention_backend", "flex")
-            if training_attention_backend == "flash_attn_3":
+            if training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
                 cp_manager = UlyssesCPManager(cp_group)
                 x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T = cp_manager.prepare_model_inputs(
                     x0_B_C_T_H_W,
