@@ -187,6 +187,12 @@ Regenerate via:
 |---------|---------|---------|
 | `omni-dreams-post-training` | (workspace) | Apache-2.0 (this repo, post-training/) |
 
+### post-training [cu128] optional FA3 backend (1)
+
+| Package | Version | License |
+|---------|---------|---------|
+| `flash-attn-3-nv` | 1.0.1 (CUDA 12.8 / PyTorch 2.7 build) | BSD-3-Clause |
+
 ### samples/post-training [dev] (3)
 
 | Package | Version | License |

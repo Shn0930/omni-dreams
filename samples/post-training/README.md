@@ -137,6 +137,29 @@ commented placeholders for `--account` and `--partition`. Either pass them
 on the `sbatch` command line, or uncomment and edit the `##SBATCH` lines at
 the top of the file.
 
+### Optional FlashAttention-3 training backend
+
+The CUDA 12.8 extra installs the x86_64 `flash-attn-3-nv` wheel with the rest
+of the release environment:
+
+```bash
+uv sync --project post-training --extra cu128
+```
+
+Set `model.config.net.training_attention_backend=flash_attn_3` to enable the
+backend. CP=1 uses block-prefix FA3 directly. CP>1 uses Ulysses all-to-all to
+transform rank-local sequence shards from `[B, S/CP, H, D]` to balanced
+full-sequence head shards `[B, S, H/CP, D]`, then restores the local sequence
+layout after attention. The Ulysses CP manager keeps pre-network inputs
+replicated and owns the single post-patch sequence partition, regardless of
+the legacy `model.config.split_cp_in_model` setting. `num_heads` must be
+divisible by the CP size.
+
+The backend is supported for BF16/FP16 single-view, non-interleaved causal
+training with `patch_temporal=1` on x86_64 Hopper (SM90). The default remains
+`flex`. The CUDA 13.0 / PyTorch 2.9 dependency index does not currently ship a
+matching `flash-attn-3-nv` wheel.
+
 ## Required env on compute nodes
 
 Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.

@@ -1898,6 +1898,20 @@ wheels = [
 ]
 
 [[package]]
+name = "flash-attn-3-nv"
+version = "1.0.1+cu128.torch27"
+source = { registry = "https://nvidia-cosmos.github.io/cosmos-dependencies/v1.2.0/cu128_torch27/simple" }
+dependencies = [
+    { name = "einops" },
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "torch", version = "2.7.0+cu128", source = { registry = "https://nvidia-cosmos.github.io/cosmos-dependencies/v1.2.0/cu128_torch27/simple" } },
+]
+wheels = [
+    { url = "https://github.com/nvidia-cosmos/cosmos-dependencies/releases/download/v1.2.0/flash_attn_3_nv-1.0.1%2Bcu128.torch27-cp39-abi3-linux_x86_64.whl", hash = "sha256:b7b93cde91b958b164471a05628bc4676191e5b318211ad09175b347158fcb36" },
+]
+
+[[package]]
 name = "fonttools"
 version = "4.62.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3657,6 +3671,15 @@ wheels = [
 ]
 
 [[package]]
+name = "ninja"
+version = "1.13.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/43/73/79a0b22fc731989c708068427579e840a6cf4e937fe7ae5c5d0b7356ac22/ninja-1.13.0.tar.gz", hash = "sha256:4a40ce995ded54d9dc24f8ea37ff3bf62ad192b547f6c7126e7e25045e76f978", size = 242558, upload-time = "2025-08-11T15:10:19.421Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ed/de/0e6edf44d6a04dabd0318a519125ed0415ce437ad5a1ec9b9be03d9048cf/ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:fb46acf6b93b8dd0322adc3a4945452a4e774b75b91293bafcc7b7f8e6517dfa", size = 180716, upload-time = "2025-08-11T15:09:58.696Z" },
+]
+
+[[package]]
 name = "nltk"
 version = "3.9.4"
 source = { registry = "https://pypi.org/simple" }
@@ -4919,6 +4942,7 @@ dependencies = [
 cu128 = [
     { name = "cosmos-oss", marker = "(extra == 'extra-10-cosmos-oss-cu128-torch27' and extra == 'extra-10-cosmos-oss-cu130-torch29') or (extra != 'extra-10-cosmos-oss-cu130-torch29' and extra == 'extra-25-omni-dreams-post-training-cu128') or (extra != 'extra-10-cosmos-oss-cu128-torch27' and extra == 'extra-25-omni-dreams-post-training-cu128')" },
     { name = "cosmos-oss", extra = ["cu128-torch27"], marker = "(extra == 'extra-10-cosmos-oss-cu128-torch27' and extra == 'extra-10-cosmos-oss-cu130-torch29') or (extra == 'extra-10-cosmos-oss-cu128-torch27' and extra == 'extra-25-omni-dreams-post-training-cu128') or (extra == 'extra-25-omni-dreams-post-training-cu128' and extra == 'extra-25-omni-dreams-post-training-cu130')" },
+    { name = "flash-attn-3-nv", version = "1.0.1+cu128.torch27", source = { registry = "https://nvidia-cosmos.github.io/cosmos-dependencies/v1.2.0/cu128_torch27/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 cu130 = [
     { name = "cosmos-oss", marker = "(extra == 'extra-10-cosmos-oss-cu128-torch27' and extra == 'extra-10-cosmos-oss-cu130-torch29') or (extra != 'extra-10-cosmos-oss-cu130-torch29' and extra == 'extra-25-omni-dreams-post-training-cu130') or (extra != 'extra-10-cosmos-oss-cu128-torch27' and extra == 'extra-25-omni-dreams-post-training-cu130')" },
@@ -4935,6 +4959,7 @@ requires-dist = [
     { name = "cosmos-oss", editable = "packages/cosmos-oss" },
     { name = "cosmos-oss", extras = ["cu128-torch27"], marker = "extra == 'cu128'", editable = "packages/cosmos-oss" },
     { name = "cosmos-oss", extras = ["cu130-torch29"], marker = "extra == 'cu130'", editable = "packages/cosmos-oss" },
+    { name = "flash-attn-3-nv", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cu128'", specifier = "==1.0.1", index = "https://nvidia-cosmos.github.io/cosmos-dependencies/v1.2.0/cu128_torch27/simple", conflict = { package = "omni-dreams-post-training", extra = "cu128" } },
 ]
 provides-extras = ["cu128", "cu130"]
 
