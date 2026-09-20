@@ -37,6 +37,7 @@ from omnidreams._src.omnidreams.modules.ulysses_attention import (
     head_to_sequence,
     sequence_to_head,
 )
+from omnidreams._src.omnidreams.networks.causal_cosmos import CosmosCausalDiT
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
@@ -159,6 +160,39 @@ def _dense_block_causal_reference(
     return torch.einsum("bhqk,bkhd->bqhd", probabilities, value.float())
 
 
+def _dense_interleave_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    frame_sequence: int,
+    num_frames_per_block: int,
+    num_interleave: int,
+) -> torch.Tensor:
+    """Independent dense oracle for the model's interleaved causal mask."""
+    scores = torch.einsum("bqhd,bkhd->bhqk", query.float(), key.float()) / math.sqrt(
+        query.shape[-1]
+    )
+    positions = torch.arange(query.shape[1], device=query.device)
+    frame_chunks = torch.div(positions, frame_sequence, rounding_mode="floor")
+    num_frame_types = num_interleave + 1
+    frame_types = frame_chunks % num_frame_types
+    block_indices = torch.div(
+        frame_chunks,
+        num_frames_per_block * num_frame_types,
+        rounding_mode="floor",
+    )
+    same_block_and_type = (block_indices[:, None] == block_indices[None, :]) & (
+        frame_types[:, None] == frame_types[None, :]
+    )
+    previous_conditioning_block = (frame_types[None, :] == num_interleave) & (
+        block_indices[None, :] < block_indices[:, None]
+    )
+    keep = same_block_and_type | previous_conditioning_block
+    probabilities = scores.masked_fill(~keep[None, None], float("-inf")).softmax(dim=-1)
+    return torch.einsum("bhqk,bkhd->bqhd", probabilities, value.float())
+
+
 def _test_flex_attention_oracle(
     device: torch.device,
     rank: int,
@@ -235,6 +269,90 @@ def _test_flex_attention_oracle(
             expected_gradient.float(),
             atol=6e-2,
             rtol=6e-2,
+        )
+
+
+def _test_flex_interleave_oracle(
+    device: torch.device,
+    rank: int,
+    world_size: int,
+) -> None:
+    batch, sequence, heads, head_dim = 1, 24 * world_size, 2 * world_size, 64
+    frame_sequence = 4
+    num_frames_per_block = 2
+    num_interleave = 1
+    num_frames = sequence // (frame_sequence * (num_interleave + 1))
+    generator = torch.Generator(device=device).manual_seed(20260921)
+    global_inputs = [
+        torch.randn(
+            batch,
+            sequence,
+            heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        for _ in range(3)
+    ]
+    output_gradient = torch.randn(
+        batch,
+        sequence,
+        heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    local_inputs = [
+        _local_sequence_shard(x, rank, world_size).detach().clone().requires_grad_(True)
+        for x in global_inputs
+    ]
+
+    block_mask = CosmosCausalDiT._prepare_blockwise_causal_attn_mask(
+        device=device,
+        num_frames=num_frames,
+        frame_seqlen=frame_sequence,
+        num_frame_per_block=num_frames_per_block,
+        num_interleave=num_interleave,
+        cp_size=1,
+    )
+    local_output = ulysses_flex_attention(
+        *local_inputs,
+        block_mask=block_mask,
+        cp_manager=UlyssesCPManager(dist.group.WORLD),
+        flex_attention_fn=compiled_flex_attention,
+    )
+    reference_inputs = [x.detach().clone().requires_grad_(True) for x in global_inputs]
+    reference_output = _dense_interleave_reference(
+        *reference_inputs,
+        frame_sequence=frame_sequence,
+        num_frames_per_block=num_frames_per_block,
+        num_interleave=num_interleave,
+    )
+    torch.testing.assert_close(
+        _gather_sequence(local_output.detach(), world_size).float(),
+        reference_output,
+        atol=3e-2,
+        rtol=3e-2,
+    )
+
+    local_output.backward(_local_sequence_shard(output_gradient, rank, world_size))
+    reference_output.backward(output_gradient.float())
+    for actual, reference in zip(local_inputs, reference_inputs, strict=True):
+        expected_gradient = _local_sequence_shard(reference.grad, rank, world_size)
+        torch.testing.assert_close(
+            actual.grad.float(),
+            expected_gradient.float(),
+            atol=6e-2,
+            rtol=6e-2,
+        )
+
+    if rank == 0:
+        print(
+            f"PASS: flex Ulysses CP={world_size} num_interleave={num_interleave} "
+            "forward and gradients",
+            flush=True,
         )
 
 
@@ -376,6 +494,7 @@ def main() -> None:
             )
         else:
             _test_flex_attention_oracle(device, dist.get_rank(), world_size)
+            _test_flex_interleave_oracle(device, dist.get_rank(), world_size)
             if os.getenv("BENCHMARK_FLEX_CP", "0") == "1":
                 _benchmark_flex_cp(device, dist.get_rank(), world_size)
         if dist.get_rank() == 0:
