@@ -17,11 +17,9 @@ from omnidreams._src.imaginaire.utils.context_parallel import (
     split_inputs_cp,
 )
 
-ULYSSES_ATTENTION_BACKENDS = frozenset({"flash_attn_3", "flash_attn_4"})
-
 
 class UlyssesCPManager:
-    """Own the replicated-input and sequence/head layouts used by FlashAttention CP."""
+    """Own replicated-input and sequence/head layouts for Ulysses CP."""
 
     def __init__(self, process_group: ProcessGroup | None = None) -> None:
         self.process_group = process_group

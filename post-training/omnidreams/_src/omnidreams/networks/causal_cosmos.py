@@ -33,14 +33,19 @@ from transformer_engine.pytorch.attention import DotProductAttention
 
 from omnidreams._src.imaginaire.utils import log
 from omnidreams._src.imaginaire.utils.context_parallel import cat_outputs_cp, cat_outputs_cp_with_grad
+from omnidreams._src.omnidreams.modules.attention_backend import (
+    FLASH_ATTENTION_BACKENDS,
+    resolve_context_parallel_backend,
+    validate_attention_backends,
+)
 from omnidreams._src.omnidreams.modules.block_causal_flash_attention import (
     ulysses_block_causal_flash_attention,
 )
-from omnidreams._src.omnidreams.modules.flex_attention import flex_attention_cp
-from omnidreams._src.omnidreams.modules.ulysses_attention import (
-    ULYSSES_ATTENTION_BACKENDS,
-    UlyssesCPManager,
+from omnidreams._src.omnidreams.modules.flex_attention import (
+    flex_attention_cp,
+    ulysses_flex_attention,
 )
+from omnidreams._src.omnidreams.modules.ulysses_attention import UlyssesCPManager
 from omnidreams._src.predict2.conditioner import DataType
 from omnidreams._src.predict2.networks.minimal_v4_dit import (
     Attention,
@@ -99,6 +104,7 @@ class CausalSelfAttention(nn.Module):
         local_attn_size: int = -1,
         sink_size: int = 0,
         training_attention_backend: str = "flex",
+        context_parallel_backend: str = "auto",
     ):
         super().__init__()
         log.debug(
@@ -121,13 +127,9 @@ class CausalSelfAttention(nn.Module):
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
-        supported_training_backends = {"flex", *ULYSSES_ATTENTION_BACKENDS}
-        if training_attention_backend not in supported_training_backends:
-            raise ValueError(
-                f"Invalid training_attention_backend={training_attention_backend!r}; "
-                f"expected one of {sorted(supported_training_backends)}"
-            )
+        validate_attention_backends(training_attention_backend, context_parallel_backend)
         self.training_attention_backend = training_attention_backend
+        self.context_parallel_backend = context_parallel_backend
         self.num_frame_per_block = 1
         self.ulysses_cp_manager = UlyssesCPManager()
 
@@ -242,19 +244,29 @@ class CausalSelfAttention(nn.Module):
             roped_q = roped_q.type_as(v)
             roped_k = roped_k.type_as(v)
 
-            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
+            resolved_cp_backend = resolve_context_parallel_backend(
+                self.training_attention_backend,
+                self.context_parallel_backend,
+                cp_size=self.ulysses_cp_manager.size,
+            )
+            if self.training_attention_backend in FLASH_ATTENTION_BACKENDS or resolved_cp_backend == "ulysses":
                 cp_size = self.ulysses_cp_manager.size
                 if video_size is None:
-                    raise ValueError("video_size is required by the block-causal FlashAttention backend")
+                    raise ValueError("video_size is required by block-causal training attention")
                 expected_sequence_length = video_size.T * video_size.H * video_size.W
                 if s * cp_size != expected_sequence_length:
                     raise ValueError(
-                        "The block-causal FlashAttention backend received an unexpected local sequence: "
+                        "Block-causal training attention received an unexpected local sequence: "
                         f"got {s} tokens on CP={cp_size}, expected global length "
                         f"{expected_sequence_length} from video_size={video_size}"
                     )
-                tokens_per_block = video_size.H * video_size.W * self.num_frame_per_block
+            if resolved_cp_backend == "ulysses":
                 self.ulysses_cp_manager.validate_num_heads(self.n_heads)
+
+            if self.training_attention_backend in FLASH_ATTENTION_BACKENDS:
+                if video_size is None:
+                    raise ValueError("video_size is required by the block-causal FlashAttention backend")
+                tokens_per_block = video_size.H * video_size.W * self.num_frame_per_block
                 out = ulysses_block_causal_flash_attention(
                     roped_q,
                     roped_k,
@@ -262,6 +274,17 @@ class CausalSelfAttention(nn.Module):
                     tokens_per_block=tokens_per_block,
                     cp_manager=self.ulysses_cp_manager,
                     attention_backend=self.training_attention_backend,
+                )
+            elif resolved_cp_backend == "ulysses":
+                if block_mask is None:
+                    raise ValueError("A block mask is required by Ulysses FlexAttention")
+                out = ulysses_flex_attention(
+                    roped_q,
+                    roped_k,
+                    v,
+                    block_mask=block_mask,
+                    cp_manager=self.ulysses_cp_manager,
+                    flex_attention_fn=flex_attention,
                 )
             else:
                 # Pad each CP rank's sequence to a multiple of 128 for FlexAttention.
@@ -423,6 +446,7 @@ class CausalCosmosBlock(nn.Module):
         local_attn_size: int = -1,
         sink_size: int = 0,
         training_attention_backend: str = "flex",
+        context_parallel_backend: str = "auto",
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -441,6 +465,7 @@ class CausalCosmosBlock(nn.Module):
             local_attn_size=local_attn_size,
             sink_size=sink_size,
             training_attention_backend=training_attention_backend,
+            context_parallel_backend=context_parallel_backend,
         )
 
         # Cross-attention (using standard Attention from minimal_v4_dit)
@@ -678,6 +703,7 @@ class CosmosCausalDiT(WeightTrainingStat):
         on_the_fly_checkpoint: bool = False,
         use_wan_fp32_strategy: bool = False,
         training_attention_backend: str = "flex",
+        context_parallel_backend: str = "auto",
         **kwargs,
     ):
         super().__init__()
@@ -699,7 +725,9 @@ class CosmosCausalDiT(WeightTrainingStat):
         self.sink_size = sink_size
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
         self.on_the_fly_checkpoint = on_the_fly_checkpoint
+        validate_attention_backends(training_attention_backend, context_parallel_backend)
         self.training_attention_backend = training_attention_backend
+        self.context_parallel_backend = context_parallel_backend
 
         # Positional embedding settings
         self.pos_emb_cls = pos_emb_cls
@@ -754,6 +782,7 @@ class CosmosCausalDiT(WeightTrainingStat):
                     local_attn_size=local_attn_size,
                     sink_size=sink_size,
                     training_attention_backend=training_attention_backend,
+                    context_parallel_backend=context_parallel_backend,
                 )
                 for _ in range(num_blocks)
             ]
@@ -815,6 +844,14 @@ class CosmosCausalDiT(WeightTrainingStat):
         if hasattr(self, "blocks"):
             for block in self.blocks:
                 block.self_attn.num_frame_per_block = value
+
+    def get_context_parallel_backend(self, cp_size: int) -> str:
+        """Resolve the configured CP strategy for the current CP degree."""
+        return resolve_context_parallel_backend(
+            self.training_attention_backend,
+            self.context_parallel_backend,
+            cp_size=cp_size,
+        )
 
     def _build_patch_embed(self) -> None:
         in_ch = self.in_channels + 1 if self.concat_padding_mask else self.in_channels
@@ -1060,7 +1097,7 @@ class CosmosCausalDiT(WeightTrainingStat):
                 img_context_emb=img_context_emb,
             )
         else:
-            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS and num_interleave != 0:
+            if self.training_attention_backend in FLASH_ATTENTION_BACKENDS and num_interleave != 0:
                 raise NotImplementedError(
                     "The block-causal FlashAttention training backends do not support num_interleave > 0"
                 )
@@ -1096,15 +1133,21 @@ class CosmosCausalDiT(WeightTrainingStat):
         cp_size = 1
         if self._is_context_parallel_enabled and self.cp_group is not None:
             cp_size = self.cp_group.size()
+        resolved_cp_backend = self.get_context_parallel_backend(cp_size)
+        mask_cp_size = cp_size if resolved_cp_backend == "legacy" else 1
+        if resolved_cp_backend == "ulysses":
+            self.ulysses_cp_manager.validate_num_heads(self.num_heads)
 
-        mask_key = f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}_cp{cp_size}"
+        mask_key = (
+            f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}"
+            f"_cpbackend{resolved_cp_backend}_cp{mask_cp_size}"
+        )
 
-        if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
+        if self.training_attention_backend in FLASH_ATTENTION_BACKENDS:
             if num_interleave != 0:
                 raise NotImplementedError(
                     "The block-causal FlashAttention training backends do not support num_interleave > 0"
                 )
-            self.ulysses_cp_manager.validate_num_heads(self.num_heads)
             if self.patch_temporal != 1:
                 raise NotImplementedError(
                     "The block-causal FlashAttention training backends currently require patch_temporal=1"
@@ -1118,7 +1161,7 @@ class CosmosCausalDiT(WeightTrainingStat):
                     frame_seqlen=frame_seqlen,
                     num_frame_per_block=self.num_frame_per_block,
                     num_interleave=num_interleave,
-                    cp_size=cp_size,
+                    cp_size=mask_cp_size,
                 )
                 self.block_mask_dict[mask_key] = block_mask
             else:
@@ -1187,7 +1230,7 @@ class CosmosCausalDiT(WeightTrainingStat):
         # Context parallel: split inputs
         cp_enabled = self._is_context_parallel_enabled and self.cp_group is not None
         if cp_enabled and self.cp_group.size() > 1:
-            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
+            if resolved_cp_backend == "ulysses":
                 split_sequence = self.ulysses_cp_manager.split_sequence
                 x_B_L_D = split_sequence(x_B_L_D, dim=1)
                 t_emb_B_L_D = split_sequence(t_emb_B_L_D, dim=1)
@@ -1260,7 +1303,7 @@ class CosmosCausalDiT(WeightTrainingStat):
         # Context parallel: gather outputs
         if cp_enabled and self.cp_group is not None:
             # Gather before FinalLayer
-            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
+            if resolved_cp_backend == "ulysses":
                 x_B_L_D = self.ulysses_cp_manager.gather_sequence_with_grad(x_B_L_D, dim=1)
             else:
                 x_B_L_D = cat_outputs_cp_with_grad(x_B_L_D, seq_dim=1, cp_group=self.cp_group)

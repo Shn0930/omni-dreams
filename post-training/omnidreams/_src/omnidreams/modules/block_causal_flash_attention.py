@@ -9,10 +9,8 @@ from functools import cache
 import torch
 
 from omnidreams._src.imaginaire.attention.flash3 import FLASH3_SUPPORTED, flash3_attention
-from omnidreams._src.omnidreams.modules.ulysses_attention import (
-    ULYSSES_ATTENTION_BACKENDS,
-    UlyssesCPManager,
-)
+from omnidreams._src.omnidreams.modules.attention_backend import FLASH_ATTENTION_BACKENDS
+from omnidreams._src.omnidreams.modules.ulysses_attention import UlyssesCPManager
 
 
 @cache
@@ -29,10 +27,9 @@ def _load_flash4_attention() -> Callable[..., torch.Tensor | tuple[torch.Tensor,
 
 
 def _validate_backend_environment(query: torch.Tensor, attention_backend: str) -> None:
-    if attention_backend not in ULYSSES_ATTENTION_BACKENDS:
+    if attention_backend not in FLASH_ATTENTION_BACKENDS:
         raise ValueError(
-            f"Invalid FlashAttention backend {attention_backend!r}; "
-            f"expected one of {sorted(ULYSSES_ATTENTION_BACKENDS)}"
+            f"Invalid FlashAttention backend {attention_backend!r}; expected one of {sorted(FLASH_ATTENTION_BACKENDS)}"
         )
 
     backend_label = "FlashAttention-3" if attention_backend == "flash_attn_3" else "FlashAttention-4"

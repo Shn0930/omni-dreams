@@ -18,10 +18,10 @@ from omnidreams._src.imaginaire.utils.context_parallel import (
     broadcast,
     broadcast_split_tensor,
 )
-from omnidreams._src.omnidreams.modules.ulysses_attention import (
-    ULYSSES_ATTENTION_BACKENDS,
-    UlyssesCPManager,
+from omnidreams._src.omnidreams.modules.attention_backend import (
+    uses_ulysses_context_parallel,
 )
+from omnidreams._src.omnidreams.modules.ulysses_attention import UlyssesCPManager
 from omnidreams._src.omnidreams.utils.misc import sync_timer
 from omnidreams._src.predict2.conditioner import DataType
 from omnidreams._src.predict2.configs.video2world.defaults.conditioner import Video2WorldCondition
@@ -110,8 +110,8 @@ class CausalJointCosmosModelConfig(Text2WorldModelRectifiedFlowConfig):
     i2v_zero_latent_condition: bool = False  # Whether to use zero/black latent as I2V condition
     max_latent_frames_per_gpu: int = 21  # Maximum latent frames per GPU for KV cache sizing
     i2v_use_original_condition: bool = False  # Whether to use original condition for I2V
-    # Legacy pre-network input sharding. Ulysses FlashAttention backends ignore
-    # this setting because their manager owns the post-patch token partition.
+    # Legacy pre-network input sharding. Ulysses CP ignores this setting because
+    # its manager owns the post-patch token partition.
     split_cp_in_model: bool = True
     # LoRA config alias for backward compatibility with downstream code (e.g. checkpointer/dcp.py)
     lora_config: I4LoraConfig = I4LoraConfig()
@@ -187,7 +187,12 @@ class CausalJointCosmosModel(Text2WorldModelRectifiedFlow):
     def split_cp_model_inputs(self) -> bool:
         """Whether CP shards raw model inputs before entering the network."""
         training_attention_backend = getattr(self.net, "training_attention_backend", "flex")
-        if training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
+        context_parallel_backend = getattr(self.net, "context_parallel_backend", "auto")
+        if uses_ulysses_context_parallel(
+            training_attention_backend,
+            context_parallel_backend,
+            cp_size=2,
+        ):
             return False
         return self.config.split_cp_in_model
 
@@ -237,15 +242,19 @@ class CausalJointCosmosModel(Text2WorldModelRectifiedFlow):
         """
         Broadcast and split the input data and condition for model parallelism.
 
-        FA3/FA4 causal delegate CP ownership to Ulysses: inputs stay replicated
-        and the network performs the only sequence partition after patching.
-        Other backends retain the legacy split_cp_in_model policy.
+        Ulysses CP keeps inputs replicated and performs the only sequence
+        partition after patching. Legacy CP retains split_cp_in_model behavior.
         """
         cp_group = self.get_context_parallel_group()
         cp_size = 1 if cp_group is None else cp_group.size()
         if condition.is_video and cp_size > 1:
             training_attention_backend = getattr(self.net, "training_attention_backend", "flex")
-            if training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
+            context_parallel_backend = getattr(self.net, "context_parallel_backend", "auto")
+            if uses_ulysses_context_parallel(
+                training_attention_backend,
+                context_parallel_backend,
+                cp_size=cp_size,
+            ):
                 cp_manager = UlyssesCPManager(cp_group)
                 x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T = cp_manager.prepare_model_inputs(
                     x0_B_C_T_H_W,

@@ -1386,6 +1386,11 @@ class CausalCrossViewCosmosDiT(CosmosCausalDiT):
                 "FlashAttention block-causal training backends are currently implemented only "
                 "for single-view models; cross-view blocks still use FlexAttention"
             )
+        if kwargs.get("context_parallel_backend", "auto") == "ulysses":
+            raise NotImplementedError(
+                "Ulysses FlexAttention is currently implemented only for single-view models; "
+                "cross-view blocks must use legacy context parallelism"
+            )
         self.state_t = state_t
         self.n_cameras_emb = n_cameras_emb
         self.view_condition_dim = view_condition_dim

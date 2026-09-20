@@ -15,7 +15,7 @@ from torchvision import transforms
 
 from omnidreams._src.imaginaire.utils import distributed
 from omnidreams._src.imaginaire.utils.context_parallel import cat_outputs_cp, cat_outputs_cp_with_grad
-from omnidreams._src.omnidreams.modules.ulysses_attention import ULYSSES_ATTENTION_BACKENDS
+from omnidreams._src.omnidreams.modules.attention_backend import FLASH_ATTENTION_BACKENDS
 from omnidreams._src.omnidreams.networks.causal_cosmos import (
     DEBUG,
     CosmosCausalDiT,
@@ -142,7 +142,7 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
                 control_input_hdmap_bbox=control_input_hdmap_bbox,
             )
         else:
-            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS and num_interleave != 0:
+            if self.training_attention_backend in FLASH_ATTENTION_BACKENDS and num_interleave != 0:
                 raise NotImplementedError(
                     "The block-causal FlashAttention training backends do not support num_interleave > 0"
                 )
@@ -180,15 +180,21 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
         cp_size = 1
         if self._is_context_parallel_enabled and self.cp_group is not None:
             cp_size = self.cp_group.size()
+        resolved_cp_backend = self.get_context_parallel_backend(cp_size)
+        mask_cp_size = cp_size if resolved_cp_backend == "legacy" else 1
+        if resolved_cp_backend == "ulysses":
+            self.ulysses_cp_manager.validate_num_heads(self.num_heads)
 
-        mask_key = f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}_cp{cp_size}"
+        mask_key = (
+            f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}"
+            f"_cpbackend{resolved_cp_backend}_cp{mask_cp_size}"
+        )
 
-        if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
+        if self.training_attention_backend in FLASH_ATTENTION_BACKENDS:
             if num_interleave != 0:
                 raise NotImplementedError(
                     "The block-causal FlashAttention training backends do not support num_interleave > 0"
                 )
-            self.ulysses_cp_manager.validate_num_heads(self.num_heads)
             if self.patch_temporal != 1:
                 raise NotImplementedError(
                     "The block-causal FlashAttention training backends currently require patch_temporal=1"
@@ -202,7 +208,7 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
                     frame_seqlen=frame_seqlen,
                     num_frame_per_block=self.num_frame_per_block,
                     num_interleave=num_interleave,
-                    cp_size=cp_size,
+                    cp_size=mask_cp_size,
                 )
                 self.block_mask_dict[mask_key] = block_mask
             else:
@@ -280,7 +286,7 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
         # Context parallel: split inputs
         cp_enabled = self._is_context_parallel_enabled and self.cp_group is not None
         if cp_enabled and self.cp_group.size() > 1:
-            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
+            if resolved_cp_backend == "ulysses":
                 split_sequence = self.ulysses_cp_manager.split_sequence
                 x_B_L_D = split_sequence(x_B_L_D, dim=1)
                 t_emb_B_L_D = split_sequence(t_emb_B_L_D, dim=1)
@@ -353,7 +359,7 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
         # Context parallel: gather outputs
         if cp_enabled and self.cp_group is not None:
             # Gather before FinalLayer
-            if self.training_attention_backend in ULYSSES_ATTENTION_BACKENDS:
+            if resolved_cp_backend == "ulysses":
                 x_B_L_D = self.ulysses_cp_manager.gather_sequence_with_grad(x_B_L_D, dim=1)
             else:
                 x_B_L_D = cat_outputs_cp_with_grad(x_B_L_D, seq_dim=1, cp_group=self.cp_group)
