@@ -5,7 +5,8 @@
 
 Run from ``post-training`` in the CUDA 12.8 environment:
 
-    uv run --extra cu128 torchrun --standalone --nproc-per-node=4 \
+    CP_SIZE=${CP_SIZE:-2}
+    uv run --extra cu128 torchrun --standalone --nproc-per-node="$CP_SIZE" \
       ../samples/post-training/tests/torchrun_ulysses_attention_correctness.py
 
 Set ``ATTENTION_BACKEND=flex`` to test FlexAttention. Add

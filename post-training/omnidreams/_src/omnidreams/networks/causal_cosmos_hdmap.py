@@ -187,7 +187,7 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
 
         mask_key = (
             f"mask_f{num_frames}_seqlen{frame_seqlen}_block{self.num_frame_per_block}"
-            f"_cpbackend{resolved_cp_backend}_cp{mask_cp_size}"
+            f"_interleave{num_interleave}_cpbackend{resolved_cp_backend}_cp{mask_cp_size}"
         )
 
         if self.training_attention_backend in FLASH_ATTENTION_BACKENDS:

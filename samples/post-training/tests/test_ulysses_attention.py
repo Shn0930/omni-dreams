@@ -195,7 +195,7 @@ def test_flash_attention_rejects_legacy_cp(backend: str) -> None:
         attention_backend.resolve_context_parallel_backend(
             backend,
             "legacy",
-            cp_size=4,
+            cp_size=2,
         )
 
 
