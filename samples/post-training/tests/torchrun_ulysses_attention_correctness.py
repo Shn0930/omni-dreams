@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 import os
 import statistics
+from copy import deepcopy
 
 import torch
 import torch.distributed as dist
@@ -32,6 +33,10 @@ from omnidreams._src.omnidreams.modules.block_causal_flash_attention import (
 from omnidreams._src.omnidreams.modules.flex_attention import (
     flex_attention_cp,
     ulysses_flex_attention,
+)
+from omnidreams._src.omnidreams.modules.framewise_adaln import (
+    apply_adaln_modulation,
+    make_token_frame_indices,
 )
 from omnidreams._src.omnidreams.modules.ulysses_attention import (
     UlyssesCPManager,
@@ -76,6 +81,88 @@ def _test_a2a_identity(device: torch.device, rank: int, world_size: int) -> None
     )
     (restored * weights).sum().backward()
     torch.testing.assert_close(local_x.grad, weights)
+
+
+def _test_framewise_adaln_oracle(
+    device: torch.device,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Validate compact AdaLN when CP shards start and end inside frames."""
+    batch, num_frames, embedding_dim = 2, world_size + 1, 16
+    tokens_per_frame = world_size
+    generator = torch.Generator(device=device).manual_seed(20260921)
+    frame_embedding = torch.randn(
+        batch,
+        num_frames,
+        embedding_dim,
+        device=device,
+        generator=generator,
+        requires_grad=True,
+    )
+    frame_lora = torch.randn(
+        batch,
+        num_frames,
+        3 * embedding_dim,
+        device=device,
+        generator=generator,
+        requires_grad=True,
+    )
+    torch.manual_seed(20260921)
+    module = torch.nn.Sequential(
+        torch.nn.SiLU(),
+        torch.nn.Linear(embedding_dim, embedding_dim, bias=False),
+        torch.nn.Linear(embedding_dim, 3 * embedding_dim, bias=False),
+    ).to(device)
+    reference_module = deepcopy(module)
+    reference_embedding = frame_embedding.detach().clone().requires_grad_(True)
+    reference_lora = frame_lora.detach().clone().requires_grad_(True)
+
+    global_indices = make_token_frame_indices(
+        num_frames,
+        tokens_per_frame,
+        device=device,
+    )
+    local_indices = _local_sequence_shard(
+        global_indices.unsqueeze(0),
+        rank,
+        world_size,
+    ).squeeze(0)
+    local_output = apply_adaln_modulation(
+        module,
+        frame_embedding,
+        frame_lora,
+        token_frame_indices=local_indices,
+        sequence_length=local_indices.numel(),
+    )
+    reference_output = reference_module(reference_embedding.index_select(1, global_indices))
+    reference_output = reference_output + reference_lora.index_select(1, global_indices)
+    torch.testing.assert_close(
+        _gather_sequence(local_output.detach(), world_size),
+        reference_output,
+    )
+
+    output_gradient = torch.randn(
+        reference_output.shape,
+        device=device,
+        generator=generator,
+    )
+    local_output.backward(_local_sequence_shard(output_gradient, rank, world_size))
+    reference_output.backward(output_gradient)
+
+    distributed_gradients = [frame_embedding.grad, frame_lora.grad]
+    distributed_gradients.extend(parameter.grad for parameter in module.parameters())
+    reference_gradients = [reference_embedding.grad, reference_lora.grad]
+    reference_gradients.extend(parameter.grad for parameter in reference_module.parameters())
+    for actual, expected in zip(distributed_gradients, reference_gradients, strict=True):
+        dist.all_reduce(actual)
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+    if rank == 0:
+        print(
+            f"PASS: framewise AdaLN CP={world_size} forward and gradients",
+            flush=True,
+        )
 
 
 def _test_flash_attention_oracle(
@@ -485,6 +572,8 @@ def main() -> None:
 
     try:
         _test_a2a_identity(device, dist.get_rank(), world_size)
+        dist.barrier()
+        _test_framewise_adaln_oracle(device, dist.get_rank(), world_size)
         dist.barrier()
         if attention_backend in FLASH_ATTENTION_BACKENDS:
             _test_flash_attention_oracle(

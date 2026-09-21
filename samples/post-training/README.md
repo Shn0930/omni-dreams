@@ -172,6 +172,19 @@ Blackwell; it uses CuTe DSL JIT compilation on the first call. The default
 remains `flex`, and this integration deliberately uses dense block-prefix calls
 rather than FA4's experimental block-sparse API.
 
+### Optional framewise AdaLN
+
+Set `model.config.net.framewise_adaln=true` to evaluate each block's three
+AdaLN-LoRA modulation MLPs on compact `[B, T, D]` frame embeddings before
+expanding their outputs to the local token sequence. The token-to-frame map is
+partitioned with the selected CP layout, so the optimization is independent of
+the attention backend and supports CP=1, legacy CP, and Ulysses CP without
+requiring frame-aligned shards. Parameter shapes and checkpoint keys are
+unchanged. A historical CP=1 FA3 A/B with attention-output SAC and custom
+prefix enabled in both arms reduced iteration time from 48.330 s to 44.523 s
+(7.88%) and peak PyTorch allocated memory by 2.175 GiB; revalidate BF16
+training numerics and performance for the target topology.
+
 ## Required env on compute nodes
 
 Set in `smoke_test.slurm`; documented here so torchrun-only users get them too.

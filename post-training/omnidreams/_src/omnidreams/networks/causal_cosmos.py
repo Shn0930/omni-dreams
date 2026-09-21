@@ -45,6 +45,10 @@ from omnidreams._src.omnidreams.modules.flex_attention import (
     flex_attention_cp,
     ulysses_flex_attention,
 )
+from omnidreams._src.omnidreams.modules.framewise_adaln import (
+    apply_adaln_modulation,
+    make_token_frame_indices,
+)
 from omnidreams._src.omnidreams.modules.ulysses_attention import UlyssesCPManager
 from omnidreams._src.predict2.conditioner import DataType
 from omnidreams._src.predict2.networks.minimal_v4_dit import (
@@ -562,6 +566,7 @@ class CausalCosmosBlock(nn.Module):
         disable_kv_cache: bool = False,
         disable_kv_cache_update: bool = False,
         video_size: VideoSize | None = None,
+        adaln_token_frame_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass through the block.
@@ -582,26 +587,37 @@ class CausalCosmosBlock(nn.Module):
             disable_kv_cache: Skip KV cache (causal-specific)
             disable_kv_cache_update: Skip cache updates (causal-specific)
             video_size: VideoSize tuple (T, H, W)
+            adaln_token_frame_indices: Optional local-token to latent-frame map.
+                When provided, AdaLN inputs use compact [B, T, *] layout.
         """
         if extra_per_block_pos_emb is not None:
             x_B_L_D = x_B_L_D + extra_per_block_pos_emb
 
         # Compute AdaLN modulation
         with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
-            if self.use_adaln_lora:
-                shift_self, scale_self, gate_self = (
-                    self.adaln_modulation_self_attn(emb_B_L_D) + adaln_lora_B_L_3D
-                ).chunk(3, dim=-1)
-                shift_cross, scale_cross, gate_cross = (
-                    self.adaln_modulation_cross_attn(emb_B_L_D) + adaln_lora_B_L_3D
-                ).chunk(3, dim=-1)
-                shift_mlp, scale_mlp, gate_mlp = (self.adaln_modulation_mlp(emb_B_L_D) + adaln_lora_B_L_3D).chunk(
-                    3, dim=-1
-                )
-            else:
-                shift_self, scale_self, gate_self = self.adaln_modulation_self_attn(emb_B_L_D).chunk(3, dim=-1)
-                shift_cross, scale_cross, gate_cross = self.adaln_modulation_cross_attn(emb_B_L_D).chunk(3, dim=-1)
-                shift_mlp, scale_mlp, gate_mlp = self.adaln_modulation_mlp(emb_B_L_D).chunk(3, dim=-1)
+            adaln_lora = adaln_lora_B_L_3D if self.use_adaln_lora else None
+            sequence_length = x_B_L_D.shape[1]
+            shift_self, scale_self, gate_self = apply_adaln_modulation(
+                self.adaln_modulation_self_attn,
+                emb_B_L_D,
+                adaln_lora,
+                token_frame_indices=adaln_token_frame_indices,
+                sequence_length=sequence_length,
+            ).chunk(3, dim=-1)
+            shift_cross, scale_cross, gate_cross = apply_adaln_modulation(
+                self.adaln_modulation_cross_attn,
+                emb_B_L_D,
+                adaln_lora,
+                token_frame_indices=adaln_token_frame_indices,
+                sequence_length=sequence_length,
+            ).chunk(3, dim=-1)
+            shift_mlp, scale_mlp, gate_mlp = apply_adaln_modulation(
+                self.adaln_modulation_mlp,
+                emb_B_L_D,
+                adaln_lora,
+                token_frame_indices=adaln_token_frame_indices,
+                sequence_length=sequence_length,
+            ).chunk(3, dim=-1)
 
         # No reshape needed as inputs are already B L D and can broadcast to B L D
 
@@ -704,6 +720,7 @@ class CosmosCausalDiT(WeightTrainingStat):
         use_wan_fp32_strategy: bool = False,
         training_attention_backend: str = "flex",
         context_parallel_backend: str = "auto",
+        framewise_adaln: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -725,6 +742,7 @@ class CosmosCausalDiT(WeightTrainingStat):
         self.sink_size = sink_size
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
         self.on_the_fly_checkpoint = on_the_fly_checkpoint
+        self.framewise_adaln = framewise_adaln
         validate_attention_backends(training_attention_backend, context_parallel_backend)
         self.training_attention_backend = training_attention_backend
         self.context_parallel_backend = context_parallel_backend
@@ -1217,12 +1235,20 @@ class CosmosCausalDiT(WeightTrainingStat):
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         frame_seqlen = video_size.H * video_size.W
-        t_emb_B_L_D = torch.repeat_interleave(t_emb_B_T_D, frame_seqlen, dim=1)
-
-        if adaln_lora_B_T_3D is not None:
-            adaln_lora_B_L_3D = torch.repeat_interleave(adaln_lora_B_T_3D, frame_seqlen, dim=1)
+        if self.framewise_adaln:
+            t_emb_for_blocks = t_emb_B_T_D
+            adaln_lora_for_blocks = adaln_lora_B_T_3D
+            adaln_token_frame_indices = make_token_frame_indices(
+                video_size.T,
+                frame_seqlen,
+                device=x_B_L_D.device,
+            )
         else:
-            adaln_lora_B_L_3D = None
+            t_emb_for_blocks = torch.repeat_interleave(t_emb_B_T_D, frame_seqlen, dim=1)
+            adaln_lora_for_blocks = (
+                None if adaln_lora_B_T_3D is None else torch.repeat_interleave(adaln_lora_B_T_3D, frame_seqlen, dim=1)
+            )
+            adaln_token_frame_indices = None
 
         if extra_pos_emb is not None:
             extra_pos_emb = rearrange(extra_pos_emb, "b t h w d -> b (t h w) d")
@@ -1233,11 +1259,14 @@ class CosmosCausalDiT(WeightTrainingStat):
             if resolved_cp_backend == "ulysses":
                 split_sequence = self.ulysses_cp_manager.split_sequence
                 x_B_L_D = split_sequence(x_B_L_D, dim=1)
-                t_emb_B_L_D = split_sequence(t_emb_B_L_D, dim=1)
                 rope_freq = split_sequence(rope_freq, dim=0)
 
-                if adaln_lora_B_L_3D is not None:
-                    adaln_lora_B_L_3D = split_sequence(adaln_lora_B_L_3D, dim=1)
+                if adaln_token_frame_indices is None:
+                    t_emb_for_blocks = split_sequence(t_emb_for_blocks, dim=1)
+                    if adaln_lora_for_blocks is not None:
+                        adaln_lora_for_blocks = split_sequence(adaln_lora_for_blocks, dim=1)
+                else:
+                    adaln_token_frame_indices = split_sequence(adaln_token_frame_indices, dim=0)
 
                 if extra_pos_emb is not None:
                     extra_pos_emb = split_sequence(extra_pos_emb, dim=1)
@@ -1245,19 +1274,35 @@ class CosmosCausalDiT(WeightTrainingStat):
                 from omnidreams._src.imaginaire.utils.context_parallel import split_inputs_cp
 
                 x_B_L_D = split_inputs_cp(x_B_L_D, seq_dim=1, cp_group=self.cp_group)
-                t_emb_B_L_D = split_inputs_cp(t_emb_B_L_D, seq_dim=1, cp_group=self.cp_group)
                 rope_freq = split_inputs_cp(rope_freq, seq_dim=0, cp_group=self.cp_group)
 
-                if adaln_lora_B_L_3D is not None:
-                    adaln_lora_B_L_3D = split_inputs_cp(adaln_lora_B_L_3D, seq_dim=1, cp_group=self.cp_group)
+                if adaln_token_frame_indices is None:
+                    t_emb_for_blocks = split_inputs_cp(t_emb_for_blocks, seq_dim=1, cp_group=self.cp_group)
+                    if adaln_lora_for_blocks is not None:
+                        adaln_lora_for_blocks = split_inputs_cp(
+                            adaln_lora_for_blocks,
+                            seq_dim=1,
+                            cp_group=self.cp_group,
+                        )
+                else:
+                    adaln_token_frame_indices = split_inputs_cp(
+                        adaln_token_frame_indices,
+                        seq_dim=0,
+                        cp_group=self.cp_group,
+                    )
 
                 if extra_pos_emb is not None:
                     extra_pos_emb = split_inputs_cp(extra_pos_emb, seq_dim=1, cp_group=self.cp_group)
 
             if distributed.get_rank() == 0 and DEBUG:
-                print(f"CP split shapes (train): x={x_B_L_D.shape}, t_emb={t_emb_B_L_D.shape}, rope={rope_freq.shape}")
-                if adaln_lora_B_L_3D is not None:
-                    print(f"adaln_lora={adaln_lora_B_L_3D.shape}")
+                print(
+                    f"CP split shapes (train): x={x_B_L_D.shape}, "
+                    f"t_emb={t_emb_for_blocks.shape}, rope={rope_freq.shape}"
+                )
+                if adaln_lora_for_blocks is not None:
+                    print(f"adaln_lora={adaln_lora_for_blocks.shape}")
+                if adaln_token_frame_indices is not None:
+                    print(f"adaln_token_frame_indices={adaln_token_frame_indices.shape}")
                 if extra_pos_emb is not None:
                     print(f"extra_pos_emb={extra_pos_emb.shape}")
 
@@ -1273,10 +1318,10 @@ class CosmosCausalDiT(WeightTrainingStat):
                 x_B_L_D = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     x_B_L_D,
-                    t_emb_B_L_D,
+                    t_emb_for_blocks,
                     context_input,
                     rope_freq,
-                    adaln_lora_B_L_3D,
+                    adaln_lora_for_blocks,
                     extra_pos_emb,
                     block_mask,
                     None,  # kv_cache
@@ -1286,18 +1331,20 @@ class CosmosCausalDiT(WeightTrainingStat):
                     False,  # disable_kv_cache
                     False,  # disable_kv_cache_update
                     video_size,
+                    adaln_token_frame_indices,
                     use_reentrant=False,
                 )
             else:
                 x_B_L_D = block(
                     x_B_L_D,
-                    t_emb_B_L_D,
+                    t_emb_for_blocks,
                     context_input,
                     rope_emb_B_L_D=rope_freq,
-                    adaln_lora_B_L_3D=adaln_lora_B_L_3D,
+                    adaln_lora_B_L_3D=adaln_lora_for_blocks,
                     extra_per_block_pos_emb=extra_pos_emb,
                     block_mask=block_mask,
                     video_size=video_size,
+                    adaln_token_frame_indices=adaln_token_frame_indices,
                 )
 
         # Context parallel: gather outputs
@@ -1407,12 +1454,20 @@ class CosmosCausalDiT(WeightTrainingStat):
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         frame_seqlen = video_size.H * video_size.W
-        t_emb_B_L_D = torch.repeat_interleave(t_emb_B_T_D, frame_seqlen, dim=1)
-
-        if adaln_lora_B_T_3D is not None:
-            adaln_lora_B_L_3D = torch.repeat_interleave(adaln_lora_B_T_3D, frame_seqlen, dim=1)
+        if self.framewise_adaln:
+            t_emb_for_blocks = t_emb_B_T_D
+            adaln_lora_for_blocks = adaln_lora_B_T_3D
+            adaln_token_frame_indices = make_token_frame_indices(
+                video_size.T,
+                frame_seqlen,
+                device=x_B_L_D.device,
+            )
         else:
-            adaln_lora_B_L_3D = None
+            t_emb_for_blocks = torch.repeat_interleave(t_emb_B_T_D, frame_seqlen, dim=1)
+            adaln_lora_for_blocks = (
+                None if adaln_lora_B_T_3D is None else torch.repeat_interleave(adaln_lora_B_T_3D, frame_seqlen, dim=1)
+            )
+            adaln_token_frame_indices = None
 
         # Context parallel: split inputs
         cp_enabled = self._is_context_parallel_enabled and self.cp_group is not None
@@ -1420,21 +1475,35 @@ class CosmosCausalDiT(WeightTrainingStat):
             from omnidreams._src.imaginaire.utils.context_parallel import split_inputs_cp
 
             x_B_L_D = split_inputs_cp(x_B_L_D, seq_dim=1, cp_group=self.cp_group)
-            t_emb_B_L_D = split_inputs_cp(t_emb_B_L_D, seq_dim=1, cp_group=self.cp_group)
             rope_freq = split_inputs_cp(rope_freq, seq_dim=0, cp_group=self.cp_group)
 
-            if adaln_lora_B_L_3D is not None:
-                adaln_lora_B_L_3D = split_inputs_cp(adaln_lora_B_L_3D, seq_dim=1, cp_group=self.cp_group)
+            if adaln_token_frame_indices is None:
+                t_emb_for_blocks = split_inputs_cp(t_emb_for_blocks, seq_dim=1, cp_group=self.cp_group)
+                if adaln_lora_for_blocks is not None:
+                    adaln_lora_for_blocks = split_inputs_cp(
+                        adaln_lora_for_blocks,
+                        seq_dim=1,
+                        cp_group=self.cp_group,
+                    )
+            else:
+                adaln_token_frame_indices = split_inputs_cp(
+                    adaln_token_frame_indices,
+                    seq_dim=0,
+                    cp_group=self.cp_group,
+                )
 
             if extra_pos_emb is not None:
                 extra_pos_emb = split_inputs_cp(extra_pos_emb, seq_dim=1, cp_group=self.cp_group)
 
             if distributed.get_rank() == 0 and DEBUG:
                 print(
-                    f"CP split shapes (inference): x={x_B_L_D.shape}, t_emb={t_emb_B_L_D.shape}, rope={rope_freq.shape}"
+                    f"CP split shapes (inference): x={x_B_L_D.shape}, "
+                    f"t_emb={t_emb_for_blocks.shape}, rope={rope_freq.shape}"
                 )
-                if adaln_lora_B_L_3D is not None:
-                    print(f"adaln_lora={adaln_lora_B_L_3D.shape}")
+                if adaln_lora_for_blocks is not None:
+                    print(f"adaln_lora={adaln_lora_for_blocks.shape}")
+                if adaln_token_frame_indices is not None:
+                    print(f"adaln_token_frame_indices={adaln_token_frame_indices.shape}")
                 if extra_pos_emb is not None:
                     print(f"extra_pos_emb={extra_pos_emb.shape}")
 
@@ -1453,10 +1522,10 @@ class CosmosCausalDiT(WeightTrainingStat):
                 x_B_L_D = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     x_B_L_D,
-                    t_emb_B_L_D,
+                    t_emb_for_blocks,
                     context_input,
                     rope_freq,
-                    adaln_lora_B_L_3D,
+                    adaln_lora_for_blocks,
                     extra_pos_emb,  # extra_per_block_pos_emb
                     None,  # block_mask
                     block_kv_cache,
@@ -1466,15 +1535,16 @@ class CosmosCausalDiT(WeightTrainingStat):
                     disable_kv_cache,
                     False,  # disable_kv_cache_update
                     video_size,
+                    adaln_token_frame_indices,
                     use_reentrant=False,
                 )
             else:
                 x_B_L_D = block(
                     x_B_L_D,
-                    t_emb_B_L_D,
+                    t_emb_for_blocks,
                     context_input,
                     rope_emb_B_L_D=rope_freq,
-                    adaln_lora_B_L_3D=adaln_lora_B_L_3D,
+                    adaln_lora_B_L_3D=adaln_lora_for_blocks,
                     block_mask=None,
                     kv_cache=block_kv_cache,
                     crossattn_cache=block_crossattn_cache,
@@ -1482,6 +1552,7 @@ class CosmosCausalDiT(WeightTrainingStat):
                     current_end=current_end,
                     disable_kv_cache=disable_kv_cache,
                     video_size=video_size,
+                    adaln_token_frame_indices=adaln_token_frame_indices,
                 )
 
         # Context parallel: gather outputs
