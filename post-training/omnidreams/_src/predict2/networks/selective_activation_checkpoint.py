@@ -62,6 +62,10 @@ _COMPILED_ATTENTION_REGION: ContextVar[bool] = ContextVar(
     "compiled_attention_region",
     default=False,
 )
+_ATTENTION_OUTPUT_SAC_ACTIVE: ContextVar[bool] = ContextVar(
+    "attention_output_sac_active",
+    default=False,
+)
 
 
 @contextmanager
@@ -73,6 +77,22 @@ def compiled_attention_region() -> Iterator[None]:
         yield
     finally:
         _COMPILED_ATTENTION_REGION.reset(token)
+
+
+def is_attention_output_sac_active() -> bool:
+    """Return whether execution is inside an attention-output SAC context."""
+
+    return _ATTENTION_OUTPUT_SAC_ACTIVE.get()
+
+
+@contextmanager
+def _attention_output_sac_context(mode) -> Iterator[None]:
+    token = _ATTENTION_OUTPUT_SAC_ACTIVE.set(True)
+    try:
+        with mode:
+            yield
+    finally:
+        _ATTENTION_OUTPUT_SAC_ACTIVE.reset(token)
 
 
 def is_attention_output_op(func: object) -> bool:
@@ -94,7 +114,11 @@ def attention_output_policy(ctx, func, *args, **kwargs):
 
 
 def attention_output_context_fn():
-    return create_selective_checkpoint_contexts(attention_output_policy)
+    forward_mode, recompute_mode = create_selective_checkpoint_contexts(attention_output_policy)
+    return (
+        _attention_output_sac_context(forward_mode),
+        _attention_output_sac_context(recompute_mode),
+    )
 
 
 @dataclass

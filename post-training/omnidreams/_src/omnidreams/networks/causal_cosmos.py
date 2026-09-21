@@ -10,7 +10,6 @@ import math
 from collections import namedtuple
 
 import torch
-import torch._inductor.config as inductor_config
 import torch.amp as amp
 import torch.nn as nn
 import transformer_engine as te
@@ -20,7 +19,8 @@ from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+from torch.nn.attention.flex_attention import flex_attention as torch_flex_attention
 from torchvision import transforms
 
 from omnidreams._src.imaginaire.utils import distributed
@@ -34,6 +34,10 @@ from transformer_engine.pytorch.attention import DotProductAttention
 
 from omnidreams._src.imaginaire.utils import log
 from omnidreams._src.imaginaire.utils.context_parallel import cat_outputs_cp, cat_outputs_cp_with_grad
+from omnidreams._src.omnidreams.modules.compiled_flex_attention import (
+    is_output_only_compiled_flex_supported,
+    output_only_compiled_flex_attention,
+)
 from omnidreams._src.omnidreams.modules.flex_attention import flex_attention_cp
 from omnidreams._src.predict2.conditioner import DataType
 from omnidreams._src.predict2.networks.minimal_v4_dit import (
@@ -50,21 +54,19 @@ from omnidreams._src.predict2.networks.minimal_v4_dit import (
     VideoRopePosition3DEmb,
 )
 from omnidreams._src.predict2.networks.model_weights_stats import WeightTrainingStat
-from omnidreams._src.predict2.networks.selective_activation_checkpoint import compiled_attention_region
+from omnidreams._src.predict2.networks.selective_activation_checkpoint import is_attention_output_sac_active
 
 # Compile flex_attention for better performance
-_compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
-if hasattr(inductor_config, "wrap_inductor_compiled_regions"):
-    _compiled_flex_attention = inductor_config.patch(wrap_inductor_compiled_regions=True)(_compiled_flex_attention)
+_compiled_flex_attention = torch.compile(torch_flex_attention, dynamic=False)
 
-    def flex_attention(*args, **kwargs):
-        # The compiled-region HOP has a generic name. Scope this marker to the
-        # compiled Flex call so SAC never caches unrelated compiled regions.
-        with compiled_attention_region():
-            return _compiled_flex_attention(*args, **kwargs)
 
-else:
-    flex_attention = _compiled_flex_attention
+def flex_attention(*args, **kwargs):
+    if is_attention_output_sac_active():
+        if not is_output_only_compiled_flex_supported():
+            raise RuntimeError("attention-output SAC for compiled FlexAttention requires PyTorch 2.10 or newer")
+        return output_only_compiled_flex_attention(*args, **kwargs)
+    return _compiled_flex_attention(*args, **kwargs)
+
 
 VideoSize = namedtuple("VideoSize", ["T", "H", "W"])
 DEBUG = False

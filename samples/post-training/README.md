@@ -145,8 +145,11 @@ The policy follows the operator that actually executes and does not bind model
 configuration to an attention backend or CP strategy. PyTorch 2.7 does not
 provide selective-checkpoint dispatch for the FlexAttention HOP; FlexAttention
 therefore requires PyTorch 2.10 or newer. On supported versions, OmniDreams
-scopes Inductor's compiled-region wrapper to the compiled FlexAttention call so
-the policy can save that output without matching unrelated compiled regions.
+uses separate compiled FlexAttention forward and backward boundaries. The
+forward exposes only the final attention output and log-sum-exp to SAC instead
+of retaining AOTAutograd's Q/K/V and internal outputs; the backward is exported
+from the same block-mask graph and compiled independently. Backward compilation
+is fail-closed because an eager fallback can materialize the full score matrix.
 Registered FlashAttention and SDPA/cuDNN ops work directly. The default
 `block_wise` mode is unchanged. This optimization trades higher activation
 memory for less backward recomputation; measure both capacity and throughput on
