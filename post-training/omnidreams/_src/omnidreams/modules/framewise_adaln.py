@@ -14,7 +14,11 @@ def make_token_frame_indices(
     *,
     device: torch.device,
 ) -> torch.Tensor:
-    """Map flattened ``[T, H, W]`` tokens to their latent-frame indices."""
+    """Return an ``[L]`` map from flattened tokens to latent frames.
+
+    ``L = num_frames * tokens_per_frame`` for the original ``[T, H, W]``
+    token layout.
+    """
 
     if num_frames <= 0:
         raise ValueError(f"num_frames must be positive, got {num_frames}")
@@ -33,10 +37,15 @@ def apply_adaln_modulation(
 ) -> torch.Tensor:
     """Evaluate an AdaLN MLP compactly and expand it to the local sequence.
 
-    Without ``token_frame_indices``, ``embedding`` and ``adaln_lora`` already
-    use token layout and retain the legacy behavior. With an index tensor they
-    use compact frame layout ``[B, T, *]``; the result is gathered into any
-    local CP token ordering, including shards that begin or end mid-frame.
+    Shapes:
+        - Legacy: ``embedding`` is ``[B, L, D]``, ``adaln_lora`` is
+          ``[B, L, 3D]``, and ``token_frame_indices`` is ``None``.
+        - Framewise: ``embedding`` is ``[B, T, D]``, ``adaln_lora`` is
+          ``[B, T, 3D]``, and ``token_frame_indices`` is ``[L]``.
+        - The returned modulation is always ``[B, L, 3D]``.
+
+    The framewise gather supports any local CP token ordering, including
+    shards that begin or end in the middle of a frame.
     """
 
     if embedding.ndim != 3:

@@ -508,10 +508,13 @@ class CausalCosmosBlock(nn.Module):
 
         Args:
             x_B_L_D: Input tensor [B, L, D]
-            emb_B_L_D: Time embedding [B, L, D]
+            emb_B_L_D: AdaLN time embedding. Despite the legacy parameter
+                name, its shape is [B, L, D] in token layout or [B, T, D]
+                in compact frame layout.
             crossattn_emb: Cross-attention context
             rope_emb_B_L_D: RoPE embeddings [L, 1, 1, D] or [B, L, 1, 1, D]
-            adaln_lora_B_L_3D: AdaLN LoRA embeddings [B, L, 3D]
+            adaln_lora_B_L_3D: AdaLN-LoRA modulation. Its shape is [B, L, 3D]
+                in token layout or [B, T, 3D] in compact frame layout.
             extra_per_block_pos_emb: Extra positional embeddings [B, L, D]
             block_mask: Block-causal mask for training (causal-specific)
             kv_cache: KV cache for inference (causal-specific)
@@ -520,14 +523,18 @@ class CausalCosmosBlock(nn.Module):
             disable_kv_cache: Skip KV cache (causal-specific)
             disable_kv_cache_update: Skip cache updates (causal-specific)
             video_size: VideoSize tuple (T, H, W)
-            adaln_token_frame_indices: Optional local-token to latent-frame map.
-                When provided, AdaLN inputs use compact [B, T, *] layout.
+            adaln_token_frame_indices: Optional [L] local-token to latent-frame
+                map. None selects token layout; a map selects compact frame
+                layout and gathers [B, T, *] inputs into [B, L, *].
         """
         if extra_per_block_pos_emb is not None:
             x_B_L_D = x_B_L_D + extra_per_block_pos_emb
 
         # Compute AdaLN modulation
         with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
+            # Legacy inputs use [B, L, D]/[B, L, 3D]. With frame indices they
+            # use compact [B, T, D]/[B, T, 3D]; the helper always returns
+            # modulation in token layout [B, L, 3D].
             adaln_embedding = emb_B_L_D
             adaln_lora = adaln_lora_B_L_3D if self.use_adaln_lora else None
             if self.use_adaln_lora and adaln_lora is None:
@@ -1109,6 +1116,8 @@ class CosmosCausalDiT(WeightTrainingStat):
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         frame_seqlen = video_size.H * video_size.W
+        # Framewise passes compact [B, T, *] tensors plus an [L] gather map;
+        # legacy materializes the repeated modulation inputs as [B, L, *].
         if self.framewise_adaln:
             t_emb_for_blocks = t_emb_B_T_D
             adaln_lora_for_blocks = adaln_lora_B_T_3D
@@ -1310,6 +1319,8 @@ class CosmosCausalDiT(WeightTrainingStat):
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         frame_seqlen = video_size.H * video_size.W
+        # Framewise passes compact [B, T, *] tensors plus an [L] gather map;
+        # legacy materializes the repeated modulation inputs as [B, L, *].
         if self.framewise_adaln:
             t_emb_for_blocks = t_emb_B_T_D
             adaln_lora_for_blocks = adaln_lora_B_T_3D

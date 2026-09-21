@@ -251,6 +251,8 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         frame_seqlen = video_size.H * video_size.W
+        # Framewise passes compact [B, T, *] tensors plus an [L] gather map;
+        # legacy materializes the repeated modulation inputs as [B, L, *].
         if self.framewise_adaln:
             t_emb_for_blocks = t_emb_B_T_D
             adaln_lora_for_blocks = adaln_lora_B_T_3D
@@ -462,6 +464,8 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         frame_seqlen = video_size.H * video_size.W
+        # Framewise passes compact [B, T, *] tensors plus an [L] gather map;
+        # legacy materializes the repeated modulation inputs as [B, L, *].
         if self.framewise_adaln:
             t_emb_for_blocks = t_emb_B_T_D
             adaln_lora_for_blocks = adaln_lora_B_T_3D
