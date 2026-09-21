@@ -9,6 +9,7 @@ from omnidreams._src.predict2.networks.selective_activation_checkpoint import (
     CheckpointMode,
     SACConfig,
     attention_output_policy,
+    compiled_attention_region,
     is_attention_output_op,
 )
 from torch.utils.checkpoint import checkpoint
@@ -86,6 +87,19 @@ def test_attention_output_policy_recomputes_non_attention_ops(op_name: str) -> N
         attention_output_policy(None, op)
         == torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
     )
+
+
+def test_compiled_region_is_saved_only_inside_attention_scope() -> None:
+    compiled_op = _NamedOp("inductor_compiled_code")
+
+    assert not is_attention_output_op(compiled_op)
+    with compiled_attention_region():
+        assert is_attention_output_op(compiled_op)
+        assert (
+            attention_output_policy(None, compiled_op)
+            == torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
+        )
+    assert not is_attention_output_op(compiled_op)
 
 
 def test_attention_output_mode_builds_selective_checkpoint_contexts() -> None:

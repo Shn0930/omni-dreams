@@ -144,11 +144,13 @@ of fused attention operators while recomputing the remaining block operations.
 The policy follows the operator that actually executes and does not bind model
 configuration to an attention backend or CP strategy. PyTorch 2.7 does not
 provide selective-checkpoint dispatch for the FlexAttention HOP; FlexAttention
-therefore requires PyTorch 2.10 or newer, while registered FlashAttention and
-SDPA/cuDNN ops work directly. The default `block_wise` mode is unchanged. This
-optimization trades higher activation memory for less backward recomputation;
-measure both capacity and throughput on the target model shape before enabling
-it in production.
+therefore requires PyTorch 2.10 or newer. On supported versions, OmniDreams
+scopes Inductor's compiled-region wrapper to the compiled FlexAttention call so
+the policy can save that output without matching unrelated compiled regions.
+Registered FlashAttention and SDPA/cuDNN ops work directly. The default
+`block_wise` mode is unchanged. This optimization trades higher activation
+memory for less backward recomputation; measure both capacity and throughput on
+the target model shape before enabling it in production.
 
 ## Required env on compute nodes
 

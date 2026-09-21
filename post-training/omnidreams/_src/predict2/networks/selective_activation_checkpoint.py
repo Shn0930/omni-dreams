@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
+from typing import Iterator
 
 import torch
 
@@ -55,12 +58,29 @@ _ATTENTION_OUTPUT_OP_MARKERS = (
     "_scaled_dot_product_efficient_attention",
     "_scaled_dot_product_cudnn_attention",
 )
+_COMPILED_ATTENTION_REGION: ContextVar[bool] = ContextVar(
+    "compiled_attention_region",
+    default=False,
+)
+
+
+@contextmanager
+def compiled_attention_region() -> Iterator[None]:
+    """Mark a compiled region whose output is a fused attention output."""
+
+    token = _COMPILED_ATTENTION_REGION.set(True)
+    try:
+        yield
+    finally:
+        _COMPILED_ATTENTION_REGION.reset(token)
 
 
 def is_attention_output_op(func: object) -> bool:
     """Return whether ``func`` is a fused attention op worth saving."""
 
     op_name = str(func).lower()
+    if _COMPILED_ATTENTION_REGION.get() and "inductor_compiled_code" in op_name:
+        return True
     return any(marker in op_name for marker in _ATTENTION_OUTPUT_OP_MARKERS)
 
 

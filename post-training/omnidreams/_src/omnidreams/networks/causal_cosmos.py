@@ -10,6 +10,7 @@ import math
 from collections import namedtuple
 
 import torch
+import torch._inductor.config as inductor_config
 import torch.amp as amp
 import torch.nn as nn
 import transformer_engine as te
@@ -33,6 +34,7 @@ from transformer_engine.pytorch.attention import DotProductAttention
 
 from omnidreams._src.imaginaire.utils import log
 from omnidreams._src.imaginaire.utils.context_parallel import cat_outputs_cp, cat_outputs_cp_with_grad
+from omnidreams._src.omnidreams.modules.flex_attention import flex_attention_cp
 from omnidreams._src.predict2.conditioner import DataType
 from omnidreams._src.predict2.networks.minimal_v4_dit import (
     Attention,
@@ -48,10 +50,21 @@ from omnidreams._src.predict2.networks.minimal_v4_dit import (
     VideoRopePosition3DEmb,
 )
 from omnidreams._src.predict2.networks.model_weights_stats import WeightTrainingStat
-from omnidreams._src.omnidreams.modules.flex_attention import flex_attention_cp
+from omnidreams._src.predict2.networks.selective_activation_checkpoint import compiled_attention_region
 
 # Compile flex_attention for better performance
-flex_attention = torch.compile(flex_attention, dynamic=False)
+_compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
+if hasattr(inductor_config, "wrap_inductor_compiled_regions"):
+    _compiled_flex_attention = inductor_config.patch(wrap_inductor_compiled_regions=True)(_compiled_flex_attention)
+
+    def flex_attention(*args, **kwargs):
+        # The compiled-region HOP has a generic name. Scope this marker to the
+        # compiled Flex call so SAC never caches unrelated compiled regions.
+        with compiled_attention_region():
+            return _compiled_flex_attention(*args, **kwargs)
+
+else:
+    flex_attention = _compiled_flex_attention
 
 VideoSize = namedtuple("VideoSize", ["T", "H", "W"])
 DEBUG = False
