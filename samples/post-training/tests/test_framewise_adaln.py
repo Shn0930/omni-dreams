@@ -10,6 +10,7 @@ import torch
 from omnidreams._src.omnidreams.modules.framewise_adaln import (
     apply_adaln_modulation,
     make_token_frame_indices,
+    prepare_adaln_block_inputs,
 )
 
 
@@ -100,6 +101,36 @@ def test_make_token_frame_indices() -> None:
         actual,
         torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]),
     )
+
+
+@pytest.mark.parametrize("framewise", [False, True])
+@pytest.mark.parametrize("with_lora", [False, True])
+def test_prepare_adaln_block_inputs(framewise: bool, with_lora: bool) -> None:
+    frame_embedding = torch.randn(2, 3, 4)
+    frame_lora = torch.randn(2, 3, 12) if with_lora else None
+
+    embedding, adaln_lora, token_frame_indices = prepare_adaln_block_inputs(
+        frame_embedding,
+        frame_lora,
+        num_frames=3,
+        tokens_per_frame=2,
+        framewise=framewise,
+    )
+
+    if framewise:
+        torch.testing.assert_close(embedding, frame_embedding)
+        if frame_lora is None:
+            assert adaln_lora is None
+        else:
+            torch.testing.assert_close(adaln_lora, frame_lora)
+        torch.testing.assert_close(token_frame_indices, torch.tensor([0, 0, 1, 1, 2, 2]))
+    else:
+        torch.testing.assert_close(embedding, torch.repeat_interleave(frame_embedding, 2, dim=1))
+        if frame_lora is None:
+            assert adaln_lora is None
+        else:
+            torch.testing.assert_close(adaln_lora, torch.repeat_interleave(frame_lora, 2, dim=1))
+        assert token_frame_indices is None
 
 
 def test_causal_block_framewise_path_matches_legacy_token_path() -> None:

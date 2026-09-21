@@ -19,6 +19,7 @@ import torch.distributed as dist
 from omnidreams._src.omnidreams.modules.framewise_adaln import (
     apply_adaln_modulation,
     make_token_frame_indices,
+    shard_adaln_block_inputs,
 )
 
 
@@ -72,15 +73,17 @@ def _test_framewise_adaln_oracle(
         tokens_per_frame,
         device=device,
     )
-    local_indices = _local_sequence_shard(
-        global_indices.unsqueeze(0),
-        rank,
-        world_size,
-    ).squeeze(0)
-    local_output = apply_adaln_modulation(
-        module,
+    local_embedding, local_lora, local_indices = shard_adaln_block_inputs(
         frame_embedding,
         frame_lora,
+        global_indices,
+        cp_group=dist.group.WORLD,
+    )
+    assert local_indices is not None
+    local_output = apply_adaln_modulation(
+        module,
+        local_embedding,
+        local_lora,
         token_frame_indices=local_indices,
         sequence_length=local_indices.numel(),
     )

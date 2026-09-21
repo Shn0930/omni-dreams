@@ -6,6 +6,9 @@
 from collections.abc import Callable
 
 import torch
+from torch.distributed import ProcessGroup
+
+from omnidreams._src.imaginaire.utils.context_parallel import split_inputs_cp
 
 
 def make_token_frame_indices(
@@ -25,6 +28,62 @@ def make_token_frame_indices(
     if tokens_per_frame <= 0:
         raise ValueError(f"tokens_per_frame must be positive, got {tokens_per_frame}")
     return torch.arange(num_frames, device=device, dtype=torch.long).repeat_interleave(tokens_per_frame)
+
+
+def prepare_adaln_block_inputs(
+    frame_embedding: torch.Tensor,
+    frame_adaln_lora: torch.Tensor | None,
+    *,
+    num_frames: int,
+    tokens_per_frame: int,
+    framewise: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Prepare AdaLN inputs and the optional token-to-frame gather map.
+
+    Framewise mode keeps ``[B, T, *]`` inputs compact and returns an ``[L]``
+    gather map. Legacy mode materializes ``[B, L, *]`` inputs and returns no
+    map.
+    """
+
+    if framewise:
+        token_frame_indices = make_token_frame_indices(
+            num_frames,
+            tokens_per_frame,
+            device=frame_embedding.device,
+        )
+        return frame_embedding, frame_adaln_lora, token_frame_indices
+
+    token_embedding = torch.repeat_interleave(frame_embedding, tokens_per_frame, dim=1)
+    token_adaln_lora = (
+        None
+        if frame_adaln_lora is None
+        else torch.repeat_interleave(frame_adaln_lora, tokens_per_frame, dim=1)
+    )
+    return token_embedding, token_adaln_lora, None
+
+
+def shard_adaln_block_inputs(
+    embedding: torch.Tensor,
+    adaln_lora: torch.Tensor | None,
+    token_frame_indices: torch.Tensor | None,
+    *,
+    cp_group: ProcessGroup,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Shard the sequence-bearing AdaLN inputs for contiguous CP.
+
+    Legacy inputs carry a token dimension and are sharded directly. Framewise
+    inputs remain replicated because only their token-to-frame gather map has a
+    sequence dimension.
+    """
+
+    if token_frame_indices is not None:
+        token_frame_indices = split_inputs_cp(token_frame_indices, seq_dim=0, cp_group=cp_group)
+        return embedding, adaln_lora, token_frame_indices
+
+    embedding = split_inputs_cp(embedding, seq_dim=1, cp_group=cp_group)
+    if adaln_lora is not None:
+        adaln_lora = split_inputs_cp(adaln_lora, seq_dim=1, cp_group=cp_group)
+    return embedding, adaln_lora, None
 
 
 def apply_adaln_modulation(
