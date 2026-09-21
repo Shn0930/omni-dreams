@@ -528,47 +528,24 @@ class CausalCosmosBlock(nn.Module):
 
         # Compute AdaLN modulation
         with amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
-            if adaln_token_frame_indices is None:
-                if self.use_adaln_lora:
-                    shift_self, scale_self, gate_self = (
-                        self.adaln_modulation_self_attn(emb_B_L_D) + adaln_lora_B_L_3D
-                    ).chunk(3, dim=-1)
-                    shift_cross, scale_cross, gate_cross = (
-                        self.adaln_modulation_cross_attn(emb_B_L_D) + adaln_lora_B_L_3D
-                    ).chunk(3, dim=-1)
-                    shift_mlp, scale_mlp, gate_mlp = (
-                        self.adaln_modulation_mlp(emb_B_L_D) + adaln_lora_B_L_3D
-                    ).chunk(3, dim=-1)
-                else:
-                    shift_self, scale_self, gate_self = self.adaln_modulation_self_attn(emb_B_L_D).chunk(3, dim=-1)
-                    shift_cross, scale_cross, gate_cross = self.adaln_modulation_cross_attn(emb_B_L_D).chunk(
-                        3, dim=-1
-                    )
-                    shift_mlp, scale_mlp, gate_mlp = self.adaln_modulation_mlp(emb_B_L_D).chunk(3, dim=-1)
-            else:
-                adaln_lora = adaln_lora_B_L_3D if self.use_adaln_lora else None
-                sequence_length = x_B_L_D.shape[1]
-                shift_self, scale_self, gate_self = apply_adaln_modulation(
-                    self.adaln_modulation_self_attn,
-                    emb_B_L_D,
+            adaln_embedding = emb_B_L_D
+            adaln_lora = adaln_lora_B_L_3D if self.use_adaln_lora else None
+            if self.use_adaln_lora and adaln_lora is None:
+                raise ValueError("AdaLN-LoRA is enabled but no modulation tensor was provided")
+            sequence_length = x_B_L_D.shape[1]
+
+            def modulate(module):
+                return apply_adaln_modulation(
+                    module,
+                    adaln_embedding,
                     adaln_lora,
                     token_frame_indices=adaln_token_frame_indices,
                     sequence_length=sequence_length,
                 ).chunk(3, dim=-1)
-                shift_cross, scale_cross, gate_cross = apply_adaln_modulation(
-                    self.adaln_modulation_cross_attn,
-                    emb_B_L_D,
-                    adaln_lora,
-                    token_frame_indices=adaln_token_frame_indices,
-                    sequence_length=sequence_length,
-                ).chunk(3, dim=-1)
-                shift_mlp, scale_mlp, gate_mlp = apply_adaln_modulation(
-                    self.adaln_modulation_mlp,
-                    emb_B_L_D,
-                    adaln_lora,
-                    token_frame_indices=adaln_token_frame_indices,
-                    sequence_length=sequence_length,
-                ).chunk(3, dim=-1)
+
+            shift_self, scale_self, gate_self = modulate(self.adaln_modulation_self_attn)
+            shift_cross, scale_cross, gate_cross = modulate(self.adaln_modulation_cross_attn)
+            shift_mlp, scale_mlp, gate_mlp = modulate(self.adaln_modulation_mlp)
 
         # No reshape needed as inputs are already B L D and can broadcast to B L D
 
