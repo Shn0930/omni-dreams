@@ -49,7 +49,9 @@ from omnidreams._src.predict2.conditioner import DataType
 from omnidreams._src.predict2.modules.neighborhood_attn import NeighborhoodAttention
 from omnidreams._src.predict2.networks.a2a_cp import MinimalA2AAttnOp, NattenA2AAttnOp
 from omnidreams._src.predict2.networks.model_weights_stats import WeightTrainingStat
-from omnidreams._src.predict2.networks.selective_activation_checkpoint import SACConfig as _SACConfig
+from omnidreams._src.predict2.networks.selective_activation_checkpoint import (
+    SACConfig as _SACConfig,
+)
 
 
 # selective activation checkpoint; only apply to the minimal v4 model. if there are change in the networks, some policy will not work as we expect.
@@ -176,6 +178,7 @@ class CheckpointMode(str, Enum):
     PREDICT2_2B_720_AGGRESSIVE = "predict2_2b_720_aggressive"
     PREDICT2_2B_720_AGGRESSIVE_V2 = "predict2_2b_720_aggressive_v2"
     PREDICT2_14B_720_AGGRESSIVE = "predict2_14b_720_aggressive"
+    ATTENTION_OUTPUT = "attention_output"
 
     def __str__(self) -> str:
         return self.value
@@ -1817,7 +1820,6 @@ class MiniTrainDIT(WeightTrainingStat):
         for i, block in enumerate(self.blocks):
             reshard_after_forward = i < len(self.blocks) - 1
             fully_shard(block, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
-
 
         fully_shard(self.final_layer, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
         if self.extra_per_block_abs_pos_emb:

@@ -27,6 +27,7 @@ class CheckpointMode(str, Enum):
     NONE = "none"
     MM_ONLY = "mm_only"
     BLOCK_WISE = "block_wise"
+    ATTENTION_OUTPUT = "attention_output"
 
     def __str__(self) -> str:
         # Optional: makes print() show just the value
@@ -47,6 +48,34 @@ def mm_only_context_fn():
     return create_selective_checkpoint_contexts(mm_only_policy)
 
 
+_ATTENTION_OUTPUT_OP_MARKERS = (
+    "flash_attn",
+    "_scaled_dot_product_flash_attention",
+    "_scaled_dot_product_efficient_attention",
+    "_scaled_dot_product_cudnn_attention",
+)
+
+
+def is_attention_output_op(func: object) -> bool:
+    """Return whether ``func`` is a fused attention op worth saving."""
+
+    op_name = str(func).lower()
+    return any(marker in op_name for marker in _ATTENTION_OUTPUT_OP_MARKERS)
+
+
+def attention_output_policy(ctx, func, *args, **kwargs):
+    """Save fused attention outputs and recompute every other operation."""
+
+    del ctx, args, kwargs
+    if is_attention_output_op(func):
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def attention_output_context_fn():
+    return create_selective_checkpoint_contexts(attention_output_policy)
+
+
 @dataclass
 class SACConfig:
     mode: str = "mm_only"
@@ -57,5 +86,7 @@ class SACConfig:
             return mm_only_context_fn
         elif self.mode == CheckpointMode.BLOCK_WISE:
             return noop_context_fn
+        elif self.mode == CheckpointMode.ATTENTION_OUTPUT:
+            return attention_output_context_fn
         else:
             raise ValueError(f"Invalid mode: {self.mode}")

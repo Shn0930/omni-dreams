@@ -137,6 +137,17 @@ commented placeholders for `--account` and `--partition`. Either pass them
 on the `sbatch` command line, or uncomment and edit the `##SBATCH` lines at
 the top of the file.
 
+### Optional attention-output activation checkpointing
+
+To trade memory for less checkpoint recomputation, set
+`model.config.net.sac_config.mode=attention_output`. This policy saves fused
+attention outputs and recomputes the remaining block operations. It is separate
+from attention and CP backend selection and is disabled by the default
+`block_wise` configuration. A historical CP=1 FA3 measurement reduced iteration
+time from 55.353 s to 48.603 s (12.19%) while increasing peak PyTorch allocated
+memory by 17.020 GiB per rank; remeasure capacity and throughput for the target
+sequence length, CP degree, and GPU before enabling it in production.
+
 ### Optional FlashAttention-3/4 and Ulysses CP backends
 
 The CUDA extras install their compatible FlashAttention packages with the rest
