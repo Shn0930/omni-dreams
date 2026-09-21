@@ -176,6 +176,7 @@ class CheckpointMode(str, Enum):
     PREDICT2_2B_720_AGGRESSIVE = "predict2_2b_720_aggressive"
     PREDICT2_2B_720_AGGRESSIVE_V2 = "predict2_2b_720_aggressive_v2"
     PREDICT2_14B_720_AGGRESSIVE = "predict2_14b_720_aggressive"
+    ATTENTION_OUTPUT = "attention_output"
 
     def __str__(self) -> str:
         return self.value
