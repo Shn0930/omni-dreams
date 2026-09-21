@@ -150,15 +150,15 @@ def test_attention_output_sac_does_not_replay_saved_attention_op() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_output_only_compiled_flex_matches_reference() -> None:
-    from omnidreams._src.omnidreams.modules.compiled_flex_attention import (
-        clear_output_only_compiled_flex_cache,
-        is_output_only_compiled_flex_supported,
-        output_only_compiled_flex_attention,
+def test_compiled_flex_attention_output_sac_matches_reference() -> None:
+    from omnidreams._src.omnidreams.modules.compiled_flex_attention_sac import (
+        clear_compiled_flex_attention_sac_cache,
+        compiled_flex_attention_for_output_sac,
+        supports_compiled_flex_attention_output_sac,
     )
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-    if not is_output_only_compiled_flex_supported():
+    if not supports_compiled_flex_attention_output_sac():
         pytest.skip("requires the PyTorch 2.10 compiled FlexAttention APIs")
 
     torch.manual_seed(1234)
@@ -181,10 +181,10 @@ def test_output_only_compiled_flex_matches_reference() -> None:
     reference = compiled_reference(*reference_inputs, block_mask=block_mask)
     reference.backward(output_gradient)
 
-    clear_output_only_compiled_flex_cache()
+    clear_compiled_flex_attention_sac_cache()
     config = SACConfig(mode=CheckpointMode.ATTENTION_OUTPUT)
     actual = checkpoint(
-        lambda query, key, value: output_only_compiled_flex_attention(
+        lambda query, key, value: compiled_flex_attention_for_output_sac(
             query,
             key,
             value,

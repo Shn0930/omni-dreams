@@ -1818,8 +1818,6 @@ class MiniTrainDIT(WeightTrainingStat):
         for i, block in enumerate(self.blocks):
             reshard_after_forward = i < len(self.blocks) - 1
             fully_shard(block, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
-
-
         fully_shard(self.final_layer, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)
         if self.extra_per_block_abs_pos_emb:
             fully_shard(self.extra_pos_embedder, mesh=mesh, reshard_after_forward=True, **fsdp_kwargs)

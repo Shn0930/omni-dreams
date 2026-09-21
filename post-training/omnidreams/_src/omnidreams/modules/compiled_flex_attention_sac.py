@@ -27,7 +27,7 @@ from torch.nn.attention.flex_attention import flex_attention as torch_flex_atten
 from omnidreams._src.predict2.networks.selective_activation_checkpoint import compiled_attention_region
 
 
-def is_output_only_compiled_flex_supported() -> bool:
+def supports_compiled_flex_attention_output_sac() -> bool:
     """Return whether this PyTorch build exposes the required compiler APIs."""
 
     return hasattr(inductor_config, "wrap_inductor_compiled_regions") and hasattr(torch, "func")
@@ -44,7 +44,7 @@ def _tensor_signature(tensor: Tensor) -> tuple[Any, ...]:
 
 
 @dataclass
-class _CompiledFlexArtifacts:
+class _CompiledFlexSacArtifacts:
     block_mask: BlockMask
     scale: float | None
     forward: Callable[..., tuple[Tensor, Tensor]]
@@ -146,17 +146,17 @@ class _CompiledFlexArtifacts:
         return compile_fx(backward_graph, backward_inputs)
 
 
-_ARTIFACTS: dict[tuple[Any, ...], _CompiledFlexArtifacts] = {}
-_ARTIFACTS_LOCK = threading.Lock()
+_SAC_ARTIFACTS: dict[tuple[Any, ...], _CompiledFlexSacArtifacts] = {}
+_SAC_ARTIFACTS_LOCK = threading.Lock()
 
 
-def _get_artifacts(
+def _get_sac_artifacts(
     query: Tensor,
     key: Tensor,
     value: Tensor,
     block_mask: BlockMask,
     scale: float | None,
-) -> _CompiledFlexArtifacts:
+) -> _CompiledFlexSacArtifacts:
     cache_key = (
         id(block_mask),
         _tensor_signature(query),
@@ -164,8 +164,8 @@ def _get_artifacts(
         _tensor_signature(value),
         scale,
     )
-    with _ARTIFACTS_LOCK:
-        artifacts = _ARTIFACTS.get(cache_key)
+    with _SAC_ARTIFACTS_LOCK:
+        artifacts = _SAC_ARTIFACTS.get(cache_key)
         if artifacts is not None:
             return artifacts
 
@@ -190,24 +190,24 @@ def _get_artifacts(
 
         compiled_forward = torch.compile(forward_only, dynamic=False, fullgraph=True)
         compiled_forward = inductor_config.patch(wrap_inductor_compiled_regions=True)(compiled_forward)
-        artifacts = _CompiledFlexArtifacts(
+        artifacts = _CompiledFlexSacArtifacts(
             block_mask=block_mask,
             scale=scale,
             forward=compiled_forward,
             raw_output=raw_output,
         )
-        _ARTIFACTS[cache_key] = artifacts
+        _SAC_ARTIFACTS[cache_key] = artifacts
         return artifacts
 
 
-class _OutputOnlyCompiledFlex(torch.autograd.Function):
+class _CompiledFlexSacFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        artifacts: _CompiledFlexArtifacts,
+        artifacts: _CompiledFlexSacArtifacts,
     ) -> Tensor:
         with compiled_attention_region():
             output, logsumexp = artifacts.forward(query, key, value)
@@ -231,7 +231,7 @@ class _OutputOnlyCompiledFlex(torch.autograd.Function):
         return grad_query, grad_key, grad_value, None
 
 
-def output_only_compiled_flex_attention(
+def compiled_flex_attention_for_output_sac(
     query: Tensor,
     key: Tensor,
     value: Tensor,
@@ -244,9 +244,9 @@ def output_only_compiled_flex_attention(
     *,
     return_aux: Any = None,
 ) -> Tensor:
-    """Run FlexAttention through an output-only compiled autograd boundary."""
+    """Run compiled FlexAttention through its attention-output SAC boundary."""
 
-    if not is_output_only_compiled_flex_supported():
+    if not supports_compiled_flex_attention_output_sac():
         raise RuntimeError("attention-output SAC for compiled FlexAttention requires PyTorch 2.10 or newer")
     if score_mod is not None:
         raise NotImplementedError("the output-only compiled FlexAttention boundary does not support score_mod")
@@ -259,12 +259,12 @@ def output_only_compiled_flex_attention(
     if kernel_options is not None:
         raise NotImplementedError("the output-only compiled FlexAttention boundary does not accept kernel_options")
 
-    artifacts = _get_artifacts(query, key, value, block_mask, scale)
-    return _OutputOnlyCompiledFlex.apply(query, key, value, artifacts)
+    artifacts = _get_sac_artifacts(query, key, value, block_mask, scale)
+    return _CompiledFlexSacFunction.apply(query, key, value, artifacts)
 
 
-def clear_output_only_compiled_flex_cache() -> None:
+def clear_compiled_flex_attention_sac_cache() -> None:
     """Clear process-local compiler artifacts. Intended for isolated tests."""
 
-    with _ARTIFACTS_LOCK:
-        _ARTIFACTS.clear()
+    with _SAC_ARTIFACTS_LOCK:
+        _SAC_ARTIFACTS.clear()

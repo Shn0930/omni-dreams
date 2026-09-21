@@ -34,9 +34,9 @@ from transformer_engine.pytorch.attention import DotProductAttention
 
 from omnidreams._src.imaginaire.utils import log
 from omnidreams._src.imaginaire.utils.context_parallel import cat_outputs_cp, cat_outputs_cp_with_grad
-from omnidreams._src.omnidreams.modules.compiled_flex_attention import (
-    is_output_only_compiled_flex_supported,
-    output_only_compiled_flex_attention,
+from omnidreams._src.omnidreams.modules.compiled_flex_attention_sac import (
+    compiled_flex_attention_for_output_sac,
+    supports_compiled_flex_attention_output_sac,
 )
 from omnidreams._src.omnidreams.modules.flex_attention import flex_attention_cp
 from omnidreams._src.predict2.conditioner import DataType
@@ -62,9 +62,9 @@ _compiled_flex_attention = torch.compile(torch_flex_attention, dynamic=False)
 
 def flex_attention(*args, **kwargs):
     if is_attention_output_sac_active():
-        if not is_output_only_compiled_flex_supported():
+        if not supports_compiled_flex_attention_output_sac():
             raise RuntimeError("attention-output SAC for compiled FlexAttention requires PyTorch 2.10 or newer")
-        return output_only_compiled_flex_attention(*args, **kwargs)
+        return compiled_flex_attention_for_output_sac(*args, **kwargs)
     return _compiled_flex_attention(*args, **kwargs)
 
 
