@@ -15,7 +15,10 @@ from torchvision import transforms
 
 from omnidreams._src.imaginaire.utils import distributed
 from omnidreams._src.imaginaire.utils.context_parallel import cat_outputs_cp, cat_outputs_cp_with_grad
-from omnidreams._src.omnidreams.modules.framewise_adaln import make_token_frame_indices
+from omnidreams._src.omnidreams.modules.framewise_adaln import (
+    prepare_adaln_block_inputs,
+    shard_adaln_block_inputs,
+)
 from omnidreams._src.omnidreams.networks.causal_cosmos import (
     DEBUG,
     CosmosCausalDiT,
@@ -251,22 +254,13 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         frame_seqlen = video_size.H * video_size.W
-        # Framewise passes compact [B, T, *] tensors plus an [L] gather map;
-        # legacy materializes the repeated modulation inputs as [B, L, *].
-        if self.framewise_adaln:
-            t_emb_for_blocks = t_emb_B_T_D
-            adaln_lora_for_blocks = adaln_lora_B_T_3D
-            adaln_token_frame_indices = make_token_frame_indices(
-                video_size.T,
-                frame_seqlen,
-                device=x_B_L_D.device,
-            )
-        else:
-            t_emb_for_blocks = torch.repeat_interleave(t_emb_B_T_D, frame_seqlen, dim=1)
-            adaln_lora_for_blocks = (
-                None if adaln_lora_B_T_3D is None else torch.repeat_interleave(adaln_lora_B_T_3D, frame_seqlen, dim=1)
-            )
-            adaln_token_frame_indices = None
+        t_emb_for_blocks, adaln_lora_for_blocks, adaln_token_frame_indices = prepare_adaln_block_inputs(
+            t_emb_B_T_D,
+            adaln_lora_B_T_3D,
+            num_frames=video_size.T,
+            tokens_per_frame=frame_seqlen,
+            framewise=self.framewise_adaln,
+        )
 
         if extra_pos_emb is not None:
             extra_pos_emb = rearrange(extra_pos_emb, "b t h w d -> b (t h w) d")
@@ -279,20 +273,12 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
             x_B_L_D = split_inputs_cp(x_B_L_D, seq_dim=1, cp_group=self.cp_group)
             rope_freq = split_inputs_cp(rope_freq, seq_dim=0, cp_group=self.cp_group)
 
-            if adaln_token_frame_indices is None:
-                t_emb_for_blocks = split_inputs_cp(t_emb_for_blocks, seq_dim=1, cp_group=self.cp_group)
-                if adaln_lora_for_blocks is not None:
-                    adaln_lora_for_blocks = split_inputs_cp(
-                        adaln_lora_for_blocks,
-                        seq_dim=1,
-                        cp_group=self.cp_group,
-                    )
-            else:
-                adaln_token_frame_indices = split_inputs_cp(
-                    adaln_token_frame_indices,
-                    seq_dim=0,
-                    cp_group=self.cp_group,
-                )
+            t_emb_for_blocks, adaln_lora_for_blocks, adaln_token_frame_indices = shard_adaln_block_inputs(
+                t_emb_for_blocks,
+                adaln_lora_for_blocks,
+                adaln_token_frame_indices,
+                cp_group=self.cp_group,
+            )
 
             if extra_pos_emb is not None:
                 extra_pos_emb = split_inputs_cp(extra_pos_emb, seq_dim=1, cp_group=self.cp_group)
@@ -464,22 +450,13 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
         x_B_L_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         frame_seqlen = video_size.H * video_size.W
-        # Framewise passes compact [B, T, *] tensors plus an [L] gather map;
-        # legacy materializes the repeated modulation inputs as [B, L, *].
-        if self.framewise_adaln:
-            t_emb_for_blocks = t_emb_B_T_D
-            adaln_lora_for_blocks = adaln_lora_B_T_3D
-            adaln_token_frame_indices = make_token_frame_indices(
-                video_size.T,
-                frame_seqlen,
-                device=x_B_L_D.device,
-            )
-        else:
-            t_emb_for_blocks = torch.repeat_interleave(t_emb_B_T_D, frame_seqlen, dim=1)
-            adaln_lora_for_blocks = (
-                None if adaln_lora_B_T_3D is None else torch.repeat_interleave(adaln_lora_B_T_3D, frame_seqlen, dim=1)
-            )
-            adaln_token_frame_indices = None
+        t_emb_for_blocks, adaln_lora_for_blocks, adaln_token_frame_indices = prepare_adaln_block_inputs(
+            t_emb_B_T_D,
+            adaln_lora_B_T_3D,
+            num_frames=video_size.T,
+            tokens_per_frame=frame_seqlen,
+            framewise=self.framewise_adaln,
+        )
 
         # Context parallel: split inputs
         cp_enabled = self._is_context_parallel_enabled and self.cp_group is not None
@@ -489,20 +466,12 @@ class CosmosCausalHdmapDiT(CosmosCausalDiT):
             x_B_L_D = split_inputs_cp(x_B_L_D, seq_dim=1, cp_group=self.cp_group)
             rope_freq = split_inputs_cp(rope_freq, seq_dim=0, cp_group=self.cp_group)
 
-            if adaln_token_frame_indices is None:
-                t_emb_for_blocks = split_inputs_cp(t_emb_for_blocks, seq_dim=1, cp_group=self.cp_group)
-                if adaln_lora_for_blocks is not None:
-                    adaln_lora_for_blocks = split_inputs_cp(
-                        adaln_lora_for_blocks,
-                        seq_dim=1,
-                        cp_group=self.cp_group,
-                    )
-            else:
-                adaln_token_frame_indices = split_inputs_cp(
-                    adaln_token_frame_indices,
-                    seq_dim=0,
-                    cp_group=self.cp_group,
-                )
+            t_emb_for_blocks, adaln_lora_for_blocks, adaln_token_frame_indices = shard_adaln_block_inputs(
+                t_emb_for_blocks,
+                adaln_lora_for_blocks,
+                adaln_token_frame_indices,
+                cp_group=self.cp_group,
+            )
 
             if extra_pos_emb is not None:
                 extra_pos_emb = split_inputs_cp(extra_pos_emb, seq_dim=1, cp_group=self.cp_group)
